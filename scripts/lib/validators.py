@@ -114,12 +114,12 @@ def validate(
     # STYLE-series sanity checks (run once)
     for (cid, sk), style in style_series.items():
         if not HEX_COLOR_RE.match(style["color"]):
-            errors.append(_err("STYLE-series", f"{cid}/{sk}/color",
+            errors.append(_err("🎨 STYLE-series", f"{cid}/{sk}/color",
                 f"สี '{style['color']}' ของ {cid}/{sk} ไม่ใช่ hex 6 หลัก",
                 f"invalid hex color '{style['color']}' for {cid}/{sk}"))
         for flag in style["flags"]:
             if flag not in ALLOWED_FLAGS:
-                errors.append(_err("STYLE-series", f"{cid}/{sk}/flags",
+                errors.append(_err("🎨 STYLE-series", f"{cid}/{sk}/flags",
                     f"flag '{flag}' ของ {cid}/{sk} ไม่รู้จัก",
                     f"unknown flag '{flag}' for {cid}/{sk}"))
 
