@@ -1,0 +1,5 @@
+[
+  ["chart_id", "section", "chart_type", "kpi_series_key"],
+  ["students-all", "education", "line", "total"],
+  ["patents", "research", "clustered-bar", "patent_filed"]
+]

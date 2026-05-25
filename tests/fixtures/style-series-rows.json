@@ -1,0 +1,6 @@
+[
+  ["chart_id", "series_key", "color", "flags"],
+  ["students-all", "bachelor", "#f29400", ""],
+  ["students-all", "graduate", "#1e6091", ""],
+  ["students-all", "total", "#0f172a", "emphasis"]
+]

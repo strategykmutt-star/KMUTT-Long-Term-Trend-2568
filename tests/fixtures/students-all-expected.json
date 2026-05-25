@@ -1,0 +1,15 @@
+{
+  "id": "students-all",
+  "section": "education",
+  "chart_type": "line",
+  "title": {"th": "จำนวนนักศึกษาทั้งหมด", "en": "Total Enrolled Students"},
+  "subtitle": {"th": "จำแนกตามระดับการศึกษา (ภาคที่ 2)", "en": "By education level (semester 2)"},
+  "categories_buddhist": ["2564", "2565", "2566", "2567", "2568"],
+  "series": [
+    {"key": "bachelor", "name": {"th": "ปริญญาตรี", "en": "Bachelor's"}, "color": "#f29400", "values": [11541, 11731, 11905, 12084, 12253]},
+    {"key": "graduate", "name": {"th": "บัณฑิตศึกษา", "en": "Graduate (M+P)"}, "color": "#1e6091", "values": [2930, 2751, 2577, 2566, 2472]},
+    {"key": "total", "name": {"th": "รวม", "en": "Total"}, "color": "#0f172a", "values": [14471, 14482, 14482, 14650, 14725], "emphasis": true}
+  ],
+  "methodology": {"th": "ทุกปีเป็นข้อมูล ณ ภาคการศึกษาที่ 2...", "en": "Data as of semester 2..."},
+  "source": {"th": "หนังสือรายงานประจำปี...", "en": "Annual reports..."}
+}
