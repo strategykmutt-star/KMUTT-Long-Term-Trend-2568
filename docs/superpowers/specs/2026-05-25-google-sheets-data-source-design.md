@@ -206,14 +206,21 @@ FIN-income-expense-3yr
 
 ### STYLE-charts tab schema (dev-only)
 
-| chart_id | section | chart_type |
-|---|---|---|
-| students-all | education | line |
-| students-new | education | line |
-| ... | ... | ... |
+| chart_id | section | chart_type | kpi_series_key |
+|---|---|---|---|
+| students-all | education | line | total |
+| students-new | education | line | total |
+| programs | education | stacked-bar | thai |
+| ... | ... | ... | ... |
 
 - One row per chart, exactly 20 rows.
-- This tab is the authoritative source for `section` and `chart_type`.
+- This tab is the authoritative source for `section`, `chart_type`, and
+  `kpi_series_key` (which series the React `KpiCard` highlights — must
+  match the `kpiSeriesKey={"..."}` prop in `web/src/App.tsx`).
+- The validator enforces that for every row here, the chart tab actually
+  contains a series with that `kpi_series_key`. Without this check, a data
+  collector deleting a series row could publish a chart whose KPI card
+  crashes at runtime (the React component does `data.series[0].values`).
 - Entire tab is cell-protected; only developers can edit.
 
 ### STYLE-series tab schema (dev-only)
@@ -276,8 +283,10 @@ ChartData = {
 | ... | ... | ... | ... | ... |
 
 - **Generated once** by `bootstrap_sheets.py`. Not updated by
-  `sync_from_sheets.py` (the service account is Viewer-only — no write
-  path to the workbook).
+  `sync_from_sheets.py` — the sync runtime treats the workbook as
+  read-only by design (the service account may remain Editor between
+  bootstrap re-runs, but the sync workflow does not write back to the
+  workbook).
 - "Jump" column uses `HYPERLINK("#gid=…")` with each chart tab's real gid,
   captured during bootstrap.
 - **Trade-off:** if a chart title is renamed in a chart tab after bootstrap,
@@ -348,13 +357,15 @@ Failure (validation or workflow error):
      {
        "event_type": "sync-sheets",
        "client_payload": {
-         "sheet_id": "...",
          "user_email": "...",
          "dry_run": false,
          "correlation_id": "abc123…"
        }
      }
      ```
+     **Note: `sheet_id` is NOT in the payload.** The workflow reads the
+     Sheet ID from a GitHub repository Variable
+     (`KMUTT_TRENDS_SHEET_ID`). This is intentional — see Authentication.
    - Opens an HtmlService modal **immediately** after the dispatch returns
      (the dispatch call itself is fast; no synchronous polling on the
      Apps Script server). The modal contains client-side JavaScript that
@@ -585,9 +596,8 @@ for cid in STYLE_CHARTS:
         errors.append(f"missing chart tab for '{cid}' (declared in STYLE-charts)")
 
 # Cross-check: every (chart_id, series_key) declared in STYLE-series must
-# appear in the corresponding chart tab. This prevents a data collector
-# from accidentally deleting a series header (which would otherwise produce
-# series:[...] missing the key, crashing the React app's KpiCard).
+# appear in the corresponding chart tab. Catches the case where the chart
+# tab's row 14 was blanked but STYLE-series still declares the series.
 expected_by_chart = {}
 for cid, sk in STYLE_SERIES:
     expected_by_chart.setdefault(cid, set()).add(sk)
@@ -597,6 +607,28 @@ for tab, data in parsed_charts.items():
     for missing_sk in expected_by_chart.get(cid, set()) - actual:
         errors.append(f"{tab}: series '{missing_sk}' declared in STYLE-series "
                       f"but missing from chart tab")
+
+# Per-chart: every chart MUST have at least one non-blank series. Catches
+# the case where the user blanked BOTH STYLE-series rows AND the chart
+# tab's row 14 — the prior cross-check would pass (no expected series
+# remain), but publishing series:[] crashes the React KpiCard
+# (it does data.series[0].values directly).
+for tab, data in parsed_charts.items():
+    if not any(s["key"].strip() for s in data["series"]):
+        errors.append(f"{tab}: chart has zero series — at least one is required")
+
+# Per-chart: the kpi_series_key declared in STYLE-charts must exist in
+# the chart's series list. The React KpiCard falls back to
+# data.series[0] when the named key is absent — which silently shows the
+# wrong KPI. Failing here surfaces the misconfiguration loudly.
+for tab, data in parsed_charts.items():
+    cid = data["id"]
+    kpi_key = STYLE_CHARTS.get(cid, {}).get("kpi_series_key", "").strip()
+    if kpi_key:
+        actual = {s["key"] for s in data["series"] if s["key"].strip()}
+        if kpi_key not in actual:
+            errors.append(f"{tab}: kpi_series_key '{kpi_key}' (STYLE-charts) "
+                          f"not found in chart series")
 
 if errors:
     write_errors_json(errors, args.errors_out)
@@ -657,6 +689,15 @@ adversarial environment), migrate to one of:
 2. A Cloud Function intermediary that holds the PAT and exposes only a
    `dispatch-sync` endpoint to the Apps Script.
 
+**Sheet ID source:** the workflow reads the Sheet ID from a GitHub
+repository Variable (`KMUTT_TRENDS_SHEET_ID`), **not** from the
+`repository_dispatch` payload. This is defense-in-depth: if the PAT
+leaks and an attacker dispatches an arbitrary payload, the workflow
+still operates on the configured Sheet — not one the attacker controls.
+The Apps Script still has `SHEET_ID` in Script Properties for local
+use (Help menu, future features), but the dispatch path no longer
+depends on it.
+
 **GitHub Action → Sheets:** Google Cloud service account (free tier). Enable
 Sheets API in a Google Cloud project, create a service account, download the
 JSON key, share the Sheets file with the service account's email.
@@ -690,7 +731,7 @@ because every JSON file still carries the legacy `slide` key.
 | 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path> --dev-email <dev's google account>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting for required text fields and duplicate years, **hard-protected ranges with `editors=[dev-email]`**, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
 | 2b | 1 min | (Optional hardening) In the Sheets share dialog, **downgrade the service account from Editor to Viewer**. After this, future bootstrap re-runs require restoring Editor temporarily. |
 | 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` AND `apps_script/PublishModal.html` → set Script Properties `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`), `HELP_URL`. Reload Sheet; verify `📤 Publish` menu appears. |
-| 4 | 5 min | In GitHub repo: add Secret `GOOGLE_SERVICE_ACCOUNT_JSON`, commit `.github/workflows/sync-from-sheets.yml` and `scripts/sync_from_sheets.py`. |
+| 4 | 5 min | In GitHub repo: add Secret `GOOGLE_SERVICE_ACCOUNT_JSON`, add Variable `KMUTT_TRENDS_SHEET_ID` (the same Sheet ID from step 1), commit `.github/workflows/sync-from-sheets.yml` and `scripts/sync_from_sheets.py`. |
 | 5 | 5 min | Sanity check: click "Check what will change (dry-run)" — should report no diff (data matches JSON because step 0 cleaned up the schema). Edit one cell, dry-run again — should show 1 file diff. Click "Publish all changes" — verify: sync job commits, deploy job builds + deploys, modal reports success only after BOTH finish, live dashboard updates. |
 | 5b | 2 min | Test recovery path: click Publish a second time without editing. Modal should still complete (sync no-op, deploy re-runs), dashboard should re-publish identical content. |
 
@@ -845,6 +886,38 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
   dispatches anything" phrasing is corrected (it still dispatches the
   sync workflow); the obsolete "retries the dispatch 3 times" line is
   replaced by accurate poll-retry behaviour.
+
+## Resolved decisions (round 6 — Codex external review)
+
+- **Shell-injection hardening.** All `${{ github.event.client_payload.* }}`
+  values used inside `run:` blocks now go through `env:` first and are
+  referenced as double-quoted shell variables. A malicious payload from a
+  leaked PAT can no longer break out into shell commands.
+- **Sheet ID moved to GitHub repository Variable.** The workflow reads
+  `KMUTT_TRENDS_SHEET_ID` from `vars`, not from `client_payload`. A
+  leaked PAT can no longer redirect the workflow to a sheet the attacker
+  controls. Apps Script payload drops `sheet_id` entirely.
+- **Service account included in protected-range editors.** Was already
+  in 5.1 but Codex round 6 (false-positive at the time) prompted clearer
+  documentation. Without this, `_reset_workbook_state()` would fail on
+  re-run trying to delete protections it can't edit.
+- **Placeholder name has unique timestamp suffix.** Previously the
+  fixed name `_bootstrap_placeholder` would collide on a re-run if a
+  prior run failed after placeholder creation. Now timestamp-suffixed +
+  any matching-prefix leftover is dropped before creating a new one.
+- **Validator catches "chart has zero series" and "kpi_series_key
+  missing from chart".** The prior STYLE-series → chart-tab cross-check
+  could be bypassed by blanking BOTH STYLE-series rows AND chart-tab
+  row-14 cells — leaving `series:[]` to crash the React KpiCard. New
+  per-chart minimum-series check + KPI-key existence check close the
+  hole. STYLE-charts now carries a `kpi_series_key` column for this.
+- **Duplicate-year conditional-format formula guarded.** Was
+  `=COUNTIF(A:A,A18)>1` which highlights every blank future-year row
+  red. Now `=AND(A18<>"",COUNTIF(A:A,A18)>1)`.
+- **INDEX-section "Viewer-only" wording softened.** Previously
+  contradicted the "optional downgrade" model. Now states the sync
+  runtime treats the workbook as read-only by design, regardless of
+  the SA's actual role.
 
 ## Effort Estimate
 

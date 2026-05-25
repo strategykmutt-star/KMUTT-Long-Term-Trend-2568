@@ -280,6 +280,7 @@ class ChartData(TypedDict):
 class StyleChart(TypedDict):
     section: Section
     chart_type: ChartType
+    kpi_series_key: str  # series key the React KpiCard highlights
 
 
 class StyleSeries(TypedDict):
@@ -346,9 +347,9 @@ Example skeleton (truncate the year list for brevity in fixtures — use 5 years
 
 ```json
 [
-  ["chart_id", "section", "chart_type"],
-  ["students-all", "education", "line"],
-  ["patents", "research", "clustered-bar"]
+  ["chart_id", "section", "chart_type", "kpi_series_key"],
+  ["students-all", "education", "line", "total"],
+  ["patents", "research", "clustered-bar", "patent_filed"]
 ]
 ```
 
@@ -416,18 +417,18 @@ def test_parse_style_charts_returns_dict_keyed_by_chart_id():
     rows = load("style-charts-rows.json")
     result = parse_style_charts(rows)
     assert result == {
-        "students-all": {"section": "education", "chart_type": "line"},
-        "patents": {"section": "research", "chart_type": "clustered-bar"},
+        "students-all": {"section": "education", "chart_type": "line", "kpi_series_key": "total"},
+        "patents": {"section": "research", "chart_type": "clustered-bar", "kpi_series_key": "patent_filed"},
     }
 
 def test_parse_style_charts_skips_blank_rows():
     rows = [
-        ["chart_id", "section", "chart_type"],
-        ["", "", ""],
-        ["students-all", "education", "line"],
+        ["chart_id", "section", "chart_type", "kpi_series_key"],
+        ["", "", "", ""],
+        ["students-all", "education", "line", "total"],
     ]
     assert parse_style_charts(rows) == {
-        "students-all": {"section": "education", "chart_type": "line"},
+        "students-all": {"section": "education", "chart_type": "line", "kpi_series_key": "total"},
     }
 
 def test_parse_style_series_returns_dict_keyed_by_tuple():
@@ -460,15 +461,19 @@ from .types import StyleChart, StyleSeries, ChartData
 
 
 def parse_style_charts(rows: list[list[str]]) -> dict[str, StyleChart]:
-    """Parse STYLE-charts tab. First row is header, skip blank rows."""
+    """Parse STYLE-charts tab. First row is header, skip blank rows.
+
+    Schema: chart_id | section | chart_type | kpi_series_key
+    """
     out: dict[str, StyleChart] = {}
     for row in rows[1:]:
         if not row or not row[0].strip():
             continue
-        chart_id, section, chart_type = (row + ["", "", ""])[:3]
+        chart_id, section, chart_type, kpi_key = (row + ["", "", "", ""])[:4]
         out[chart_id.strip()] = {
             "section": section.strip(),  # type: ignore[typeddict-item]
             "chart_type": chart_type.strip(),  # type: ignore[typeddict-item]
+            "kpi_series_key": kpi_key.strip(),
         }
     return out
 
@@ -745,7 +750,8 @@ GOOD_CHART = {
     "methodology": {"th": "x", "en": "y"},
     "source": {"th": "x", "en": "y"},
 }
-STYLE_CHARTS = {"students-all": {"section": "education", "chart_type": "line"}}
+STYLE_CHARTS = {"students-all": {"section": "education", "chart_type": "line",
+                                  "kpi_series_key": "bachelor"}}
 STYLE_SERIES = {("students-all", "bachelor"): {"color": "#000000", "flags": []}}
 
 def test_valid_chart_produces_no_errors():
@@ -839,6 +845,26 @@ def test_series_declared_in_style_but_missing_from_tab_flagged():
     errors = validate({"EDU-students-all": GOOD_CHART}, STYLE_CHARTS, style)
     assert any("'extra'" in e["message_en"] and "missing from chart tab" in e["message_en"]
                for e in errors)
+
+def test_chart_with_zero_series_flagged():
+    """Critical: catches the case where user blanks BOTH STYLE-series
+    rows AND chart-tab headers — previous cross-check would pass with
+    empty expected_by_chart, but publishing series:[] crashes React."""
+    bad = {**GOOD_CHART, "series": []}
+    # Empty STYLE-series so cross-check passes
+    errors = validate({"EDU-students-all": bad}, STYLE_CHARTS, {})
+    assert any("zero series" in e["message_en"] for e in errors)
+
+def test_kpi_series_key_not_in_chart_flagged():
+    """Catches a STYLE-charts kpi_series_key that doesn't match any
+    series in the chart tab — KpiCard would silently fall back to the
+    wrong series."""
+    # STYLE-charts says KPI is 'phantom' but chart only has 'bachelor'
+    style_charts = {"students-all": {"section": "education", "chart_type": "line",
+                                      "kpi_series_key": "phantom"}}
+    style_series = {("students-all", "bachelor"): {"color": "#000000", "flags": []}}
+    errors = validate({"EDU-students-all": GOOD_CHART}, style_charts, style_series)
+    assert any("kpi_series_key 'phantom'" in e["message_en"] for e in errors)
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -977,6 +1003,29 @@ def validate(
             errors.append(_err(tab, f"series.{sk}",
                 f"ขาด series '{sk}' (ระบุไว้ใน STYLE-series)",
                 f"series '{sk}' declared in STYLE-series but missing from chart tab"))
+
+    # Every chart must have at least one non-blank series. Catches the
+    # case where the user blanked BOTH STYLE-series rows AND the chart
+    # tab's row 14 — the previous cross-check would silently pass.
+    # Publishing series:[] would crash the React KpiCard.
+    for tab, data in parsed_charts.items():
+        if not any(s["key"].strip() for s in data["series"]):
+            errors.append(_err(tab, "series",
+                "กราฟต้องมี series อย่างน้อย 1 ตัว",
+                "chart has zero series — at least one is required"))
+
+    # The kpi_series_key declared in STYLE-charts must exist in the
+    # chart's actual series list. Without this, KpiCard's fallback to
+    # data.series[0] silently shows the wrong KPI.
+    for tab, data in parsed_charts.items():
+        cid = data["id"]
+        kpi_key = style_charts.get(cid, {}).get("kpi_series_key", "").strip()
+        if kpi_key:
+            actual_keys = {s["key"] for s in data["series"] if s["key"].strip()}
+            if kpi_key not in actual_keys:
+                errors.append(_err(tab, "kpi_series_key",
+                    f"kpi_series_key '{kpi_key}' (STYLE-charts) ไม่พบใน series",
+                    f"kpi_series_key '{kpi_key}' (STYLE-charts) not found in chart series"))
 
     return errors
 ```
@@ -1238,8 +1287,8 @@ def make_fake_client():
         "EDU-students-all": json.loads((FIX / "students-all-rows.json").read_text(encoding="utf-8"))
     }
     client.get_style_charts.return_value = [
-        ["chart_id", "section", "chart_type"],
-        ["students-all", "education", "line"],
+        ["chart_id", "section", "chart_type", "kpi_series_key"],
+        ["students-all", "education", "line", "total"],
     ]
     # style-series fixture already only has students-all entries
     client.get_style_series.return_value = json.loads((FIX / "style-series-rows.json").read_text(encoding="utf-8"))
@@ -1437,20 +1486,35 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > /tmp/gcp-key.json
 
+      # SHEET_ID and USER_EMAIL go through `env:` rather than direct
+      # `${{ ... }}` interpolation in shell. This prevents script
+      # injection from a malicious `repository_dispatch` payload: with
+      # env vars, a payload value like `abc"; rm -rf` becomes a literal
+      # string assigned to the env var, not shell tokens. See:
+      # https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+      #
+      # Defense-in-depth: SHEET_ID is read from a GitHub repository
+      # Variable, NOT the dispatch payload, so an attacker with PAT
+      # cannot point the workflow at a different sheet they control.
+
       - name: Run sync script (publish)
         if: github.event.client_payload.dry_run != true
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
         run: |
           python scripts/sync_from_sheets.py \
-            --sheet-id "${{ github.event.client_payload.sheet_id }}" \
+            --sheet-id "$SHEET_ID" \
             --credentials /tmp/gcp-key.json \
             --result-out result.json \
             --errors-out errors.json
 
       - name: Run sync script (dry-run)
         if: github.event.client_payload.dry_run == true
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
         run: |
           python scripts/sync_from_sheets.py \
-            --sheet-id "${{ github.event.client_payload.sheet_id }}" \
+            --sheet-id "$SHEET_ID" \
             --credentials /tmp/gcp-key.json \
             --result-out result.json \
             --errors-out errors.json \
@@ -1475,6 +1539,11 @@ jobs:
       - name: Commit and push if changes
         id: commit
         if: success() && github.event.client_payload.dry_run != true
+        env:
+          # USER_EMAIL also goes through env to avoid shell injection in
+          # the commit message. Double-quoting `"$USER_EMAIL"` makes
+          # bash treat the value as a literal string.
+          USER_EMAIL: ${{ github.event.client_payload.user_email }}
         run: |
           if [ -z "$(git status --porcelain web/src/data/)" ]; then
             echo "No JSON changes — skipping commit (idempotent no-op)."
@@ -1484,7 +1553,7 @@ jobs:
           git config user.name "kmutt-trends-bot"
           git config user.email "bot@users.noreply.github.com"
           git add web/src/data/
-          git commit -m "Sync from Sheets by ${{ github.event.client_payload.user_email }} at $(date -u +%FT%TZ)"
+          git commit -m "Sync from Sheets by $USER_EMAIL at $(date -u +%FT%TZ)"
           git push
           echo "did_commit=true" >> "$GITHUB_OUTPUT"
 
@@ -1674,11 +1743,16 @@ function _ghHeaders(pat) {
 function _dispatchSync(dryRun) {
   const props = _props();
   const pat = props.getProperty('GITHUB_PAT');
-  const sheetId = props.getProperty('SHEET_ID');
   const repo = props.getProperty('REPO');
-  if (!pat || !sheetId || !repo) {
-    return { ok: false, error: 'Script Properties ไม่ครบ (GITHUB_PAT, SHEET_ID, REPO)' };
+  if (!pat || !repo) {
+    return { ok: false, error: 'Script Properties ไม่ครบ (GITHUB_PAT, REPO)' };
   }
+  // NOTE: sheet_id is NOT sent in client_payload. The workflow reads the
+  // sheet ID from a GitHub repository Variable (KMUTT_TRENDS_SHEET_ID)
+  // instead. This is defense-in-depth: even if the PAT leaks, an
+  // attacker cannot redirect the workflow to a sheet they control.
+  // SHEET_ID is still set as a Script Property for the Help menu / future
+  // use, but the dispatch path does not depend on it.
   const correlationId = Utilities.getUuid().replace(/-/g, '').slice(0, 16);
   const userEmail = Session.getActiveUser().getEmail() || 'unknown';
   const resp = UrlFetchApp.fetch(
@@ -1690,8 +1764,9 @@ function _dispatchSync(dryRun) {
       payload: JSON.stringify({
         event_type: 'sync-sheets',
         client_payload: {
-          sheet_id: sheetId, user_email: userEmail,
-          dry_run: dryRun, correlation_id: correlationId,
+          user_email: userEmail,
+          dry_run: dryRun,
+          correlation_id: correlationId,
         },
       }),
       muteHttpExceptions: true,
@@ -1954,10 +2029,32 @@ def build_chart_tab_values(chart: dict) -> list[list]:
     return rows
 
 
+# Pinned KPI-series-key mapping. Source of truth is the kpiSeriesKey
+# props in web/src/App.tsx — if App.tsx changes, update this table AND
+# re-run bootstrap. The sync-time validator enforces that the chart tab
+# actually contains the named series, so KPI-card crashes are caught.
+KPI_SERIES_KEY = {
+    "students-new": "total", "students-all": "total",
+    "programs": "thai", "graduates": "total",
+    "employment-bachelor": "employed", "employment-graduate": "employed",
+    "staff-total": "total", "faculty-degree": "total",
+    "staff-academic-support": "academic",
+    "research-funding": "total", "research-funding-3yr": "total",
+    "research-per-staff": "per_active_researcher",
+    "research-per-staff-3yr": "per_active_researcher",
+    "research-per-academic-3yr": "per_academic",
+    "publications": "total", "publications-3yr": "total",
+    "publications-per-academic": "per_academic",
+    "patents": "patent_filed",
+    "income-expense": "revenue", "income-expense-3yr": "revenue",
+}
+
+
 def build_style_charts_rows(charts: list[dict]) -> list[list]:
-    rows = [["chart_id", "section", "chart_type"]]
+    rows = [["chart_id", "section", "chart_type", "kpi_series_key"]]
     for c in charts:
-        rows.append([c["id"], c["section"], c["chart_type"]])
+        rows.append([c["id"], c["section"], c["chart_type"],
+                     KPI_SERIES_KEY.get(c["id"], "")])
     return rows
 
 
@@ -1995,12 +2092,19 @@ def main():
     #   a) Drop all existing protected ranges and conditional format rules
     #      (otherwise leftover protections from a prior run will block
     #      subsequent writes, even from the service account).
-    #   b) Create a temporary placeholder tab so we can delete every other
-    #      tab without hitting Sheets' "cannot delete the last sheet" rule.
-    #   c) Delete every tab except the placeholder.
-    #   d) At the end of the script, delete the placeholder.
+    #   b) Drop any leftover placeholder from a previous bootstrap that
+    #      failed midway (matches the prefix, not just an exact name).
+    #   c) Create a NEW placeholder with a unique timestamp suffix so
+    #      partial-failure re-runs never collide.
+    #   d) Delete every tab except the new placeholder.
+    #   e) At the end of the script, delete the placeholder.
     _reset_workbook_state(sh)
-    placeholder = sh.add_worksheet(title="_bootstrap_placeholder", rows=1, cols=1)
+    for ws in list(sh.worksheets()):
+        if ws.title.startswith("_bootstrap_placeholder"):
+            sh.del_worksheet(ws)
+    import time
+    placeholder_name = f"_bootstrap_placeholder_{int(time.time())}"
+    placeholder = sh.add_worksheet(title=placeholder_name, rows=1, cols=1)
     for ws in list(sh.worksheets()):
         if ws.id != placeholder.id:
             sh.del_worksheet(ws)
@@ -2150,14 +2254,18 @@ def _apply_chart_tab_guardrails(sh, charts, chart_gid, allowed_editors):
                 }
             }
         })
-        # Conditional format: duplicate year rows
+        # Conditional format: duplicate year rows.
+        # IMPORTANT: the AND(A18<>"") guard is necessary. A naked
+        # COUNTIF(A:A,A18)>1 treats blank cells as duplicates of each
+        # other, so every empty future-year row would highlight red the
+        # instant bootstrap finishes.
         requests.append({
             "addConditionalFormatRule": {
                 "rule": {
                     "ranges": [{"sheetId": gid, "startRowIndex": 17, "startColumnIndex": 0, "endColumnIndex": 1}],
                     "booleanRule": {
                         "condition": {"type": "CUSTOM_FORMULA",
-                                      "values": [{"userEnteredValue": "=COUNTIF(A:A,A18)>1"}]},
+                                      "values": [{"userEnteredValue": "=AND(A18<>\"\",COUNTIF(A:A,A18)>1)"}]},
                         "format": {"backgroundColor": PINK},
                     }
                 },
@@ -2359,7 +2467,11 @@ Content (numbered to match spec Initial Migration steps 0–5):
 4. Generate fine-grained GitHub PAT — **Contents: write, Actions: read**.
    (Contents: read is NOT enough; `repository_dispatch` requires write.
    Actions: read is needed for the Apps Script to poll workflow runs.)
-5. Add GitHub Secret `GOOGLE_SERVICE_ACCOUNT_JSON`.
+5. Add GitHub Secret `GOOGLE_SERVICE_ACCOUNT_JSON`. Also add GitHub
+   **Variable** (not secret — it's not sensitive) `KMUTT_TRENDS_SHEET_ID`
+   with the same Sheet ID from step 2. The workflow reads from this
+   Variable instead of trusting `repository_dispatch` payload — defense
+   against PAT leak.
 6. Run `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path> --dev-email <your-google-account>`.
    The `--dev-email` is the Google account that should be allowed to edit
    protected ranges (rows 1, 13, 14 and the STYLE tabs). Without this you
