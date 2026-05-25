@@ -43,7 +43,8 @@ tests/
 └── test_sync.py
 
 apps_script/
-└── Code.gs                   # Apps Script source (committed for review)
+├── Code.gs                   # Server-side: menu, dispatch, polling RPCs
+└── PublishModal.html         # Client-side modal: live polling, result rendering
 
 .github/workflows/
 └── sync-from-sheets.yml
@@ -59,11 +60,11 @@ pyproject.toml                 # pytest config
 
 **Modified files:**
 
-- `web/src/types.ts` — drop `slide: number`, tighten `subtitle: Bilingual | null` → `subtitle: Bilingual`
-- `web/src/components/ChartCard.tsx:22` — remove now-unnecessary null-check on subtitle
-- `web/src/data/*.json` (all 20) — auto-cleaned on first sync (drops `slide`); no manual edit
-- `build_chart_json.py` — add `DEPRECATED` header
-- `README.md` — replace "Updating data from a new PPT" section with Sheets workflow
+- `web/src/types.ts` — drop `slide: number`, tighten `subtitle: Bilingual | null` → `subtitle: Bilingual` (Phase 0.5)
+- `web/src/components/ChartCard.tsx` — remove now-unnecessary null-check on subtitle (Phase 0.5)
+- `web/src/data/*.json` (all 20) — strip `slide` key in Phase 0.5 so first dry-run shows zero diff
+- `build_chart_json.py` — add `DEPRECATED` header (Phase 6)
+- `README.md` — replace "Updating data from a new PPT" section with Sheets workflow (Phase 6)
 
 ---
 
@@ -114,6 +115,115 @@ Expected: "no tests ran" (no test files yet) — not an error.
 ```bash
 git add scripts/ tests/ requirements-dev.txt pyproject.toml
 git commit -m "chore: scaffold Python project for Sheets sync"
+```
+
+---
+
+## Phase 0.5: Schema-cleanup migration (one-time)
+
+This is the migration commit referenced as **step 0** of the spec's Initial
+Migration section. Doing it now (before any new code runs) means the first
+dry-run after Sheets bootstrap will report 0 changed files — the proof that
+the new round-trip is byte-stable.
+
+### Task 0.5.1: Strip `slide` from JSON, tighten types
+
+**Files:**
+- Modify: all 20 files in `web/src/data/*.json`
+- Modify: `web/src/types.ts`
+- Modify: `web/src/components/ChartCard.tsx`
+
+- [ ] **Step 1: Write a one-shot Python script to strip `slide`**
+
+```bash
+python - <<'EOF'
+import json
+from pathlib import Path
+for p in sorted(Path("web/src/data").glob("*.json")):
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    obj.pop("slide", None)
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"stripped slide from {p.name}")
+EOF
+```
+
+- [ ] **Step 2: Verify no `slide` keys remain**
+
+```bash
+grep -l '"slide"' web/src/data/*.json || echo "all clean"
+```
+Expected: `all clean`.
+
+- [ ] **Step 3: Update web/src/types.ts**
+
+Replace the full file with:
+
+```typescript
+export type Lang = 'th' | 'en'
+
+export interface Bilingual {
+  th: string
+  en: string
+}
+
+export interface ChartSeries {
+  key: string
+  name: Bilingual
+  color: string
+  values: (number | null)[]
+  emphasis?: boolean
+  exclude_from_stack?: boolean
+  is_cumulative?: boolean
+}
+
+export type ChartType = 'line' | 'stacked-bar' | 'clustered-bar'
+
+export interface ChartData {
+  id: string
+  section: 'education' | 'personnel' | 'research' | 'finance'
+  chart_type: ChartType
+  title: Bilingual
+  subtitle: Bilingual
+  categories_buddhist: string[]
+  series: ChartSeries[]
+  methodology: Bilingual
+  source: Bilingual
+}
+```
+
+- [ ] **Step 4: Update web/src/components/ChartCard.tsx**
+
+Change:
+
+```tsx
+{data.subtitle && (
+  <p className="mt-1 text-sm text-slate-500">{data.subtitle[lang]}</p>
+)}
+```
+
+to:
+
+```tsx
+<p className="mt-1 text-sm text-slate-500">{data.subtitle[lang]}</p>
+```
+
+- [ ] **Step 5: Verify the React app still builds**
+
+```bash
+cd web && npm run build
+```
+Expected: build succeeds with no errors.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/src/data/ web/src/types.ts web/src/components/ChartCard.tsx
+git commit -m "refactor: drop legacy slide field, require subtitle
+
+Migration commit ahead of Sheets-driven sync. The slide field was a
+PPTX-era artefact unused by the React app; subtitle was always non-null
+in practice. Tightening both makes the post-bootstrap JSON byte-identical
+to what sync_from_sheets.py will produce."
 ```
 
 ---
@@ -423,11 +533,37 @@ def test_parse_chart_tab_treats_empty_value_cells_as_none():
     result = parse_chart_tab(rows, style_charts, style_series)
     bachelor = next(s for s in result["series"] if s["key"] == "bachelor")
     assert bachelor["values"][2] is None
+
+def test_parse_chart_tab_preserves_blank_series_key_position():
+    """Critical: a blank cell in row 14 must NOT cause data columns to shift."""
+    rows = load("students-all-rows.json")
+    # Blank the "graduate" key in column C of row 14 (0-idx 13)
+    rows[13][2] = ""
+    style_charts = parse_style_charts(load("style-charts-rows.json"))
+    style_series = parse_style_series(load("style-series-rows.json"))
+
+    result = parse_chart_tab(rows, style_charts, style_series)
+    # Series list still has 3 entries; the middle one's key is empty
+    assert len(result["series"]) == 3
+    assert result["series"][0]["key"] == "bachelor"
+    assert result["series"][1]["key"] == ""  # the blank
+    assert result["series"][2]["key"] == "total"
+    # Crucially: bachelor data did NOT absorb the middle column's values
+    assert result["series"][0]["values"] == [11541, 11731, 11905, 12084, 12253]
+    # The blank-key series still carries its column's data — validator will reject it
+    assert result["series"][1]["values"] == [2930, 2751, 2577, 2566, 2472]
 ```
 
 - [ ] **Step 2: Verify tests fail**
 
 - [ ] **Step 3: Implement parse_chart_tab**
+
+**Key design point:** the parser MUST preserve column positions in the
+series_key row. If row 14 has `[bachelor, "", graduate, total]`, the
+parser emits a 4-entry series list with one empty-key entry. The validator
+catches that and fails. If the parser collapsed to 3 entries, the data
+columns would silently shift onto the wrong series. STYLE-series lookup
+for empty keys is skipped (those are reported by the validator).
 
 ```python
 # Append to scripts/lib/parsers.py
@@ -439,29 +575,51 @@ def parse_chart_tab(
     style_charts: dict,
     style_series: dict,
 ) -> ChartData:
-    """Parse a single chart tab. Joins with STYLE config for color/section/chart_type."""
+    """Parse a single chart tab. Joins with STYLE config for color/section/chart_type.
+
+    Preserves column positions in the series_key row so the validator can
+    detect blank/duplicate keys instead of silently shifting data columns.
+    """
     chart_id = rows[0][1].strip()
     style_c = style_charts.get(chart_id)
     if style_c is None:
         raise KeyError(f"Chart id '{chart_id}' missing from STYLE-charts")
 
-    # Metadata rows (0-indexed): 2,3=title; 4,5=subtitle; 7,8=methodology; 9,10=source
     def cell(r: int) -> str:
         return rows[r][1].strip() if len(rows[r]) > 1 else ""
 
-    # Series header at rows 13,14,15 (0-indexed)
-    keys = [c.strip() for c in rows[13][1:] if c.strip()]
-    names_th = [c.strip() for c in rows[14][1:1 + len(keys)]]
-    names_en = [c.strip() for c in rows[15][1:1 + len(keys)]]
+    # Series header at rows 13,14,15 (0-indexed). Determine the
+    # rightmost non-blank column in the entire header block; truncate
+    # trailing all-blank columns but keep mid-block blanks.
+    raw_keys = list(rows[13][1:]) if len(rows[13]) > 1 else []
+    raw_names_th = list(rows[14][1:]) if len(rows[14]) > 1 else []
+    raw_names_en = list(rows[15][1:]) if len(rows[15]) > 1 else []
+    width = max(len(raw_keys), len(raw_names_th), len(raw_names_en))
+    # Right-trim columns that are blank in ALL three header rows
+    while width > 0:
+        i = width - 1
+        last_key = raw_keys[i].strip() if i < len(raw_keys) else ""
+        last_th = raw_names_th[i].strip() if i < len(raw_names_th) else ""
+        last_en = raw_names_en[i].strip() if i < len(raw_names_en) else ""
+        if last_key or last_th or last_en:
+            break
+        width -= 1
+
+    def at(lst: list, i: int) -> str:
+        return lst[i].strip() if i < len(lst) else ""
+
+    keys = [at(raw_keys, i) for i in range(width)]
+    names_th = [at(raw_names_th, i) for i in range(width)]
+    names_en = [at(raw_names_en, i) for i in range(width)]
 
     # Data table from row 17 onward (0-indexed)
     years: list[str] = []
-    values_by_col: list[list[float | None]] = [[] for _ in keys]
+    values_by_col: list[list[float | None]] = [[] for _ in range(width)]
     for row in rows[DATA_START_ROW:]:
         if not row or not row[0].strip():
             continue
         years.append(row[0].strip())
-        for i in range(len(keys)):
+        for i in range(width):
             cell_val = row[i + 1] if len(row) > i + 1 else ""
             cell_val = cell_val.strip() if isinstance(cell_val, str) else cell_val
             if cell_val == "" or cell_val is None:
@@ -471,17 +629,23 @@ def parse_chart_tab(
 
     series = []
     for i, key in enumerate(keys):
-        style_s = style_series.get((chart_id, key))
-        if style_s is None:
-            raise KeyError(f"Series '{chart_id}/{key}' missing from STYLE-series")
         entry: dict = {
             "key": key,
             "name": {"th": names_th[i], "en": names_en[i]},
-            "color": style_s["color"],
             "values": values_by_col[i],
         }
-        for flag in style_s["flags"]:
-            entry[flag] = True
+        # Only join with STYLE-series for non-blank keys; blanks are
+        # caught by the validator.
+        if key:
+            style_s = style_series.get((chart_id, key))
+            if style_s is not None:
+                entry["color"] = style_s["color"]
+                for flag in style_s["flags"]:
+                    entry[flag] = True
+            else:
+                entry["color"] = ""  # validator will report missing STYLE-series
+        else:
+            entry["color"] = ""
         series.append(entry)
 
     # Convert floats with no fractional part back to int for cleaner JSON
@@ -583,6 +747,39 @@ def test_missing_chart_tab_for_declared_chart_id():
     errors = validate({}, STYLE_CHARTS, STYLE_SERIES)
     assert any("missing chart tab" in e["message_en"].lower()
                and "students-all" in e["message_en"] for e in errors)
+
+def test_year_out_of_range_flagged():
+    bad = {**GOOD_CHART, "categories_buddhist": ["2566", "2567", "9999"]}
+    errors = validate({"EDU-students-all": bad}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("9999" in e["message_en"] and "outside" in e["message_en"] for e in errors)
+
+def test_non_integer_year_flagged():
+    bad = {**GOOD_CHART, "categories_buddhist": ["2566", "abc", "2568"]}
+    errors = validate({"EDU-students-all": bad}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("'abc'" in e["message_en"] and "integer" in e["message_en"] for e in errors)
+
+def test_blank_series_name_flagged():
+    bad_series = {**GOOD_CHART["series"][0], "name": {"th": "", "en": "Bachelor's"}}
+    bad = {**GOOD_CHART, "series": [bad_series]}
+    errors = validate({"EDU-students-all": bad}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("name (TH)" in e["message_en"] for e in errors)
+
+def test_blank_series_key_in_middle_flagged():
+    """Critical: parser keeps blank-key entries; validator must surface them."""
+    blank = {"key": "", "name": {"th": "", "en": ""}, "color": "", "values": [1, 2, 3]}
+    bad = {**GOOD_CHART, "series": [GOOD_CHART["series"][0], blank]}
+    errors = validate({"EDU-students-all": bad}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("empty series_key" in e["message_en"] for e in errors)
+
+def test_invalid_hex_color_in_style_flagged():
+    bad_style = {("students-all", "bachelor"): {"color": "red", "flags": []}}
+    errors = validate({"EDU-students-all": GOOD_CHART}, STYLE_CHARTS, bad_style)
+    assert any("invalid hex color" in e["message_en"] for e in errors)
+
+def test_unknown_flag_in_style_flagged():
+    bad_style = {("students-all", "bachelor"): {"color": "#000", "flags": ["bogus"]}}
+    errors = validate({"EDU-students-all": GOOD_CHART}, STYLE_CHARTS, bad_style)
+    assert any("unknown flag" in e["message_en"] and "bogus" in e["message_en"] for e in errors)
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -596,6 +793,7 @@ def test_missing_chart_tab_for_declared_chart_id():
 All errors are returned in both Thai (for the data collector's UI modal)
 and English (for the GitHub Action log).
 """
+import re
 from .types import ChartData, StyleChart, StyleSeries, ValidationError
 
 REQUIRED_TEXT_FIELDS = [
@@ -604,6 +802,9 @@ REQUIRED_TEXT_FIELDS = [
     ("methodology", "th"), ("methodology", "en"),
     ("source", "th"), ("source", "en"),
 ]
+ALLOWED_FLAGS = {"emphasis", "exclude_from_stack", "is_cumulative"}
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+YEAR_MIN, YEAR_MAX = 2500, 2700
 
 
 def _err(tab: str | None, field: str | None, th: str, en: str) -> ValidationError:
@@ -617,7 +818,6 @@ def validate(
 ) -> list[ValidationError]:
     errors: list[ValidationError] = []
 
-    # Per-chart-tab checks
     for tab, data in parsed_charts.items():
         cid = data["id"]
 
@@ -633,16 +833,34 @@ def validate(
         if years != sorted(years):
             errors.append(_err(tab, "categories_buddhist",
                 "ปีไม่ได้เรียงจากน้อยไปมาก", "years not sorted ascending"))
+        for y in years:
+            try:
+                yi = int(y)
+                if yi < YEAR_MIN or yi > YEAR_MAX:
+                    errors.append(_err(tab, "categories_buddhist",
+                        f"ปี '{y}' อยู่นอกช่วง {YEAR_MIN}-{YEAR_MAX}",
+                        f"year '{y}' outside {YEAR_MIN}-{YEAR_MAX}"))
+            except ValueError:
+                errors.append(_err(tab, "categories_buddhist",
+                    f"ปี '{y}' ไม่ใช่จำนวนเต็ม",
+                    f"year '{y}' is not an integer"))
 
+        # Column-position-preserving series_key check: blanks ARE reported
+        # (the parser keeps them as empty strings; we surface them here).
         keys = [s["key"] for s in data["series"]]
-        if any(not k.strip() for k in keys):
+        for i, k in enumerate(keys):
+            if not k.strip():
+                errors.append(_err(tab, "series_key",
+                    f"ช่อง series_key ว่างเปล่า (แถว 14, คอลัมน์ {chr(ord('B') + i)})",
+                    f"empty series_key in row 14, column {chr(ord('B') + i)}"))
+        nonblank = [k for k in keys if k.strip()]
+        if len(set(nonblank)) != len(nonblank):
             errors.append(_err(tab, "series_key",
-                "ช่อง series_key (แถว 14) ว่างเปล่า", "empty series_key cell in row 14"))
-        if len(set(keys)) != len(keys):
-            errors.append(_err(tab, "series_key",
-                "series_key (แถว 14) ซ้ำกัน", "duplicate series_key in row 14"))
+                "series_key ซ้ำกัน (แถว 14)", "duplicate series_key in row 14"))
 
         for s in data["series"]:
+            if not s["key"].strip():
+                continue  # already reported above
             if (cid, s["key"]) not in style_series:
                 errors.append(_err(tab, f"series.{s['key']}",
                     f"series '{s['key']}' ไม่อยู่ใน STYLE-series",
@@ -651,6 +869,14 @@ def validate(
                 errors.append(_err(tab, f"series.{s['key']}",
                     f"จำนวนค่า '{s['key']}' ไม่เท่ากับจำนวนปี",
                     f"series '{s['key']}' value count != year count"))
+            if not s["name"]["th"].strip():
+                errors.append(_err(tab, f"series.{s['key']}.name.th",
+                    f"ขาดชื่อ TH ของ series '{s['key']}'",
+                    f"missing series name (TH) for '{s['key']}'"))
+            if not s["name"]["en"].strip():
+                errors.append(_err(tab, f"series.{s['key']}.name.en",
+                    f"ขาดชื่อ EN ของ series '{s['key']}'",
+                    f"missing series name (EN) for '{s['key']}'"))
 
         for path in REQUIRED_TEXT_FIELDS:
             value = data.get(path[0], {}).get(path[1], "")  # type: ignore[call-overload]
@@ -658,6 +884,18 @@ def validate(
                 field_name = ".".join(path)
                 errors.append(_err(tab, field_name,
                     f"ขาดข้อมูล {field_name}", f"missing {field_name}"))
+
+    # STYLE-series sanity checks (run once)
+    for (cid, sk), style in style_series.items():
+        if not HEX_COLOR_RE.match(style["color"]):
+            errors.append(_err(f"🎨 STYLE-series", f"{cid}/{sk}/color",
+                f"สี '{style['color']}' ของ {cid}/{sk} ไม่ใช่ hex 6 หลัก",
+                f"invalid hex color '{style['color']}' for {cid}/{sk}"))
+        for flag in style["flags"]:
+            if flag not in ALLOWED_FLAGS:
+                errors.append(_err(f"🎨 STYLE-series", f"{cid}/{sk}/flags",
+                    f"flag '{flag}' ของ {cid}/{sk} ไม่รู้จัก",
+                    f"unknown flag '{flag}' for {cid}/{sk}"))
 
     # Cross-check: every chart_id in STYLE-charts must have a matching tab
     parsed_ids = {d["id"] for d in parsed_charts.values()}
@@ -1139,10 +1377,12 @@ jobs:
           retention-days: 7
 
       - name: Commit and push if changes
+        id: commit
         if: success() && github.event.client_payload.dry_run != true
         run: |
           if [ -z "$(git status --porcelain web/src/data/)" ]; then
             echo "No JSON changes — skipping commit (idempotent no-op)."
+            echo "did_commit=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "kmutt-trends-bot"
@@ -1150,6 +1390,19 @@ jobs:
           git add web/src/data/
           git commit -m "Sync from Sheets by ${{ github.event.client_payload.user_email }} at $(date -u +%FT%TZ)"
           git push
+          echo "did_commit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger deploy.yml explicitly
+        # The plain `git push` above does NOT trigger deploy.yml because
+        # commits made with GITHUB_TOKEN are exempt from kicking off
+        # downstream workflows. We bridge that gap by explicitly dispatching
+        # deploy.yml — `workflow_dispatch` IS allowed for GITHUB_TOKEN.
+        # See: https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication
+        if: success() && steps.commit.outputs.did_commit == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run deploy.yml --ref main
 ```
 
 - [ ] **Step 2: Sanity check YAML syntax**
@@ -1170,29 +1423,39 @@ git commit -m "feat(ci): workflow to sync Sheets → JSON on repository_dispatch
 
 ## Phase 4: Apps Script
 
-### Task 4.1: Code.gs — menu + dispatch + polling + modals
+### Task 4.1: Code.gs + PublishModal.html — async publish UX
 
 **Files:**
 - Create: `apps_script/Code.gs`
+- Create: `apps_script/PublishModal.html`
 
-Apps Script has limited automated-testing infrastructure; this task relies on careful writing + manual integration testing in Phase 6.
+**Architecture note.** Apps Script server-side functions are capped at
+6 minutes per invocation. The earlier draft did synchronous `Utilities.sleep`
+polling in a single function call, which blocked the spreadsheet and would
+have hit the runtime cap on slow workflows. This revision uses
+[HtmlService](https://developers.google.com/apps-script/guides/html) with
+client-side polling via `google.script.run` — each server RPC is short
+(< 1 second), the modal updates live in the user's browser, and there's
+no execution-cap risk.
 
-- [ ] **Step 1: Write the Apps Script**
+Apps Script has limited automated-testing infrastructure; this task relies
+on careful writing + manual integration testing in Phase 7.
+
+- [ ] **Step 1: Write `apps_script/Code.gs` (server side)**
 
 ```javascript
 // apps_script/Code.gs
 //
-// KMUTT Trends Dashboard — publish button.
-// Setup: set Script Properties GITHUB_PAT, SHEET_ID, REPO (e.g. "kmutt/dash").
+// KMUTT Trends Dashboard — publish button (server side).
+// Setup: set Script Properties GITHUB_PAT, SHEET_ID, REPO, HELP_URL.
 //
-const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_MS = 5 * 60 * 1000;
-// TODO(setup): replace <org>/<repo> with the actual GitHub repo path during initial setup
-const HELP_URL = 'https://github.com/<org>/<repo>/blob/main/docs/data-collector-guide-th.md';
+// All long-running work lives client-side in PublishModal.html, which calls
+// these server functions via google.script.run. Each call returns quickly.
+//
 
 function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('📤 Publish to Dashboard')
+  SpreadsheetApp.getUi()
+    .createMenu('📤 Publish to Dashboard')
     .addItem('Check what will change (dry-run)', 'runDryRun')
     .addItem('Publish all changes', 'runPublish')
     .addSeparator()
@@ -1201,256 +1464,283 @@ function onOpen() {
 }
 
 function openHelp() {
+  const url = PropertiesService.getScriptProperties().getProperty('HELP_URL')
+    || 'https://github.com/<org>/<repo>/blob/main/docs/data-collector-guide-th.md';
   const html = HtmlService.createHtmlOutput(
     `<p>เปิดคู่มือผู้รวบรวมข้อมูล:</p>
-     <p><a href="${HELP_URL}" target="_blank">${HELP_URL}</a></p>`
+     <p><a href="${url}" target="_blank">${url}</a></p>`
   ).setWidth(420).setHeight(120);
   SpreadsheetApp.getUi().showModalDialog(html, '📖 คู่มือ');
 }
 
-function runDryRun() { _dispatch(true); }
-function runPublish() { _dispatch(false); }
+function runDryRun() { _openPublishModal(true); }
+function runPublish() { _openPublishModal(false); }
 
-function _dispatch(dryRun) {
-  const props = PropertiesService.getScriptProperties();
+function _openPublishModal(dryRun) {
+  // Dispatch first (fast). Then open the modal that polls.
+  const dispatch = _dispatchSync(dryRun);
+  if (!dispatch.ok) {
+    SpreadsheetApp.getUi().alert(`❌ ${dispatch.error}`);
+    return;
+  }
+  const template = HtmlService.createTemplateFromFile('PublishModal');
+  template.correlationId = dispatch.correlationId;
+  template.dryRun = dryRun;
+  template.repo = _props().getProperty('REPO');
+  const html = template.evaluate().setWidth(560).setHeight(440);
+  SpreadsheetApp.getUi().showModalDialog(
+    html, dryRun ? '🔍 ตรวจสอบความเปลี่ยนแปลง' : '📤 Publish to Dashboard'
+  );
+}
+
+// ---------- functions invoked from the modal via google.script.run ----------
+
+function dispatchSync(dryRun) { return _dispatchSync(dryRun); }
+
+function pollStatus(correlationId) {
+  const props = _props();
+  const repo = props.getProperty('REPO');
+  const pat = props.getProperty('GITHUB_PAT');
+  const r = UrlFetchApp.fetch(
+    `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=20`,
+    { headers: _ghHeaders(pat), muteHttpExceptions: true }
+  );
+  if (r.getResponseCode() !== 200) {
+    return { found: false, error: `GitHub API ตอบ HTTP ${r.getResponseCode()}` };
+  }
+  const runs = JSON.parse(r.getContentText()).workflow_runs || [];
+  // IMPORTANT: filter on display_title (which reflects `run-name:`), NOT name
+  // (which is the workflow's static `name:` field).
+  const match = runs.find(run =>
+    run.display_title && run.display_title.indexOf(correlationId) >= 0
+  );
+  if (!match) return { found: false };
+  return {
+    found: true,
+    runId: match.id,
+    status: match.status,            // queued | in_progress | completed
+    conclusion: match.conclusion,    // null until status==completed
+    htmlUrl: match.html_url,
+  };
+}
+
+function fetchResult(runId, kind) {
+  // kind is 'sync-result' or 'sync-errors'
+  const fileName = kind === 'sync-errors' ? 'errors.json' : 'result.json';
+  return _downloadArtifactJson(runId, kind, fileName);
+}
+
+// ---------- internals ----------
+
+function _props() { return PropertiesService.getScriptProperties(); }
+
+function _ghHeaders(pat) {
+  return { Authorization: `Bearer ${pat}`, Accept: 'application/vnd.github+json' };
+}
+
+function _dispatchSync(dryRun) {
+  const props = _props();
   const pat = props.getProperty('GITHUB_PAT');
   const sheetId = props.getProperty('SHEET_ID');
   const repo = props.getProperty('REPO');
   if (!pat || !sheetId || !repo) {
-    SpreadsheetApp.getUi().alert('❌ Script Properties ไม่ครบ (GITHUB_PAT, SHEET_ID, REPO)');
-    return;
+    return { ok: false, error: 'Script Properties ไม่ครบ (GITHUB_PAT, SHEET_ID, REPO)' };
   }
   const correlationId = Utilities.getUuid().replace(/-/g, '').slice(0, 16);
   const userEmail = Session.getActiveUser().getEmail() || 'unknown';
-
-  const payload = {
-    event_type: 'sync-sheets',
-    client_payload: {
-      sheet_id: sheetId, user_email: userEmail,
-      dry_run: dryRun, correlation_id: correlationId,
-    },
-  };
-
   const resp = UrlFetchApp.fetch(
     `https://api.github.com/repos/${repo}/dispatches`,
     {
       method: 'post',
-      headers: {
-        Authorization: `Bearer ${pat}`,
-        Accept: 'application/vnd.github+json',
-      },
+      headers: _ghHeaders(pat),
       contentType: 'application/json',
-      payload: JSON.stringify(payload),
+      payload: JSON.stringify({
+        event_type: 'sync-sheets',
+        client_payload: {
+          sheet_id: sheetId, user_email: userEmail,
+          dry_run: dryRun, correlation_id: correlationId,
+        },
+      }),
       muteHttpExceptions: true,
     }
   );
   if (resp.getResponseCode() !== 204) {
-    SpreadsheetApp.getUi().alert(
-      `❌ ส่งคำสั่งไป GitHub ไม่สำเร็จ (HTTP ${resp.getResponseCode()})\n${resp.getContentText()}`);
-    return;
+    return { ok: false, error: `dispatch failed (HTTP ${resp.getResponseCode()}): ${resp.getContentText()}` };
   }
-
-  // Show status modal — polls in a loop. Apps Script doesn't support async UI,
-  // so we render a single result modal after polling completes.
-  const result = _pollForRun(repo, pat, correlationId);
-  _showResult(result, dryRun, repo);
+  return { ok: true, correlationId };
 }
 
-function _pollForRun(repo, pat, correlationId) {
-  const start = Date.now();
-  let runId = null;
-  while (Date.now() - start < POLL_TIMEOUT_MS) {
-    Utilities.sleep(POLL_INTERVAL_MS);
-    const r = UrlFetchApp.fetch(
-      `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=20`,
-      { headers: { Authorization: `Bearer ${pat}` }, muteHttpExceptions: true }
-    );
-    if (r.getResponseCode() !== 200) continue;
-    const runs = JSON.parse(r.getContentText()).workflow_runs || [];
-    const match = runs.find(run => run.name && run.name.indexOf(correlationId) >= 0);
-    if (!match) continue;
-    runId = match.id;
-    if (match.status === 'completed') {
-      return { runId, conclusion: match.conclusion, htmlUrl: match.html_url };
-    }
-  }
-  return { runId, conclusion: 'timeout', htmlUrl: null };
-}
-
-function _showResult(result, dryRun, repo) {
-  const ui = SpreadsheetApp.getUi();
-  if (result.conclusion === 'timeout') {
-    ui.alert(`⏳ Publish ใช้เวลานานกว่าปกติ\nดูสถานะที่: ${result.htmlUrl || 'GitHub Actions'}`);
-    return;
-  }
-  if (result.conclusion === 'success') {
-    const data = _downloadArtifactJson(repo, result.runId, 'sync-result', 'result.json');
-    const title = dryRun ? '🔍 ผลการตรวจสอบ (ยังไม่ publish)' : '✅ Publish สำเร็จ';
-    const body = _renderResultBody(data, dryRun);
-    const html = HtmlService.createHtmlOutput(body).setWidth(520).setHeight(400);
-    ui.showModalDialog(html, title);
-    return;
-  }
-  // failure
-  const errors = _downloadArtifactJson(repo, result.runId, 'sync-errors', 'errors.json');
-  const body = _renderErrorBody(errors, result.htmlUrl);
-  const html = HtmlService.createHtmlOutput(body).setWidth(520).setHeight(400);
-  ui.showModalDialog(html, '❌ Publish ไม่สำเร็จ');
-}
-
-function _downloadArtifactJson(repo, runId, artifactName, fileInsideZip) {
-  // List artifacts for this run, find the named artifact, download the ZIP,
-  // unzip it in-memory, extract the JSON file.
-  const props = PropertiesService.getScriptProperties();
+function _downloadArtifactJson(runId, artifactName, fileInsideZip) {
+  const props = _props();
+  const repo = props.getProperty('REPO');
   const pat = props.getProperty('GITHUB_PAT');
-  const list = JSON.parse(UrlFetchApp.fetch(
+  const listResp = UrlFetchApp.fetch(
     `https://api.github.com/repos/${repo}/actions/runs/${runId}/artifacts`,
-    { headers: { Authorization: `Bearer ${pat}` } }
-  ).getContentText());
-  const artifact = (list.artifacts || []).find(a => a.name === artifactName);
+    { headers: _ghHeaders(pat), muteHttpExceptions: true }
+  );
+  if (listResp.getResponseCode() !== 200) return null;
+  const artifact = (JSON.parse(listResp.getContentText()).artifacts || [])
+    .find(a => a.name === artifactName);
   if (!artifact) return null;
   const zipResp = UrlFetchApp.fetch(artifact.archive_download_url, {
-    headers: { Authorization: `Bearer ${pat}` },
-    followRedirects: true,
+    headers: _ghHeaders(pat), followRedirects: true,
   });
   const blobs = Utilities.unzip(zipResp.getBlob().setContentType('application/zip'));
   const file = blobs.find(b => b.getName() === fileInsideZip);
-  if (!file) return null;
-  return JSON.parse(file.getDataAsString('UTF-8'));
+  return file ? JSON.parse(file.getDataAsString('UTF-8')) : null;
 }
+```
 
-function _renderResultBody(data, dryRun) {
-  if (!data) return '<p>ไม่พบข้อมูลผลลัพธ์</p>';
-  const files = data.changed_files || [];
-  if (files.length === 0) {
-    return '<p>ไม่มีการเปลี่ยนแปลง — ข้อมูลใน Sheets ตรงกับ dashboard อยู่แล้ว</p>';
-  }
-  const items = files.map(f => `<li>${f}</li>`).join('');
-  const verb = dryRun ? 'จะมีการเปลี่ยนแปลง' : 'เปลี่ยนแปลง';
-  return `<p>${verb} ${files.length} ไฟล์:</p><ul>${items}</ul>`;
-}
+- [ ] **Step 2: Write `apps_script/PublishModal.html` (client side)**
 
-function _renderErrorBody(errors, runUrl) {
-  if (!errors || !errors.length) {
-    return `<p>เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ</p>
-            <p><a href="${runUrl}" target="_blank">ดูรายละเอียดบน GitHub</a></p>`;
+```html
+<!-- apps_script/PublishModal.html -->
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; padding: 16px; color: #0f172a; }
+  #status { font-size: 14px; margin-bottom: 12px; min-height: 24px; }
+  ul { margin: 4px 0 12px 18px; padding: 0; }
+  li { margin-bottom: 4px; line-height: 1.4; }
+  .err-tab { font-weight: 600; margin-top: 12px; }
+  .err-field { color: #6b7280; font-family: monospace; font-size: 12px; }
+  .footer { margin-top: 16px; font-size: 12px; color: #475569; }
+  .footer a { color: #1e6091; }
+  .spinner { display: inline-block; width: 12px; height: 12px;
+             border: 2px solid #cbd5e1; border-top-color: #1e6091;
+             border-radius: 50%; animation: spin 1s linear infinite;
+             vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div id="status"><span class="spinner"></span> ส่งคำสั่งไป GitHub แล้ว — กำลังรอเริ่มงาน…</div>
+  <div id="result"></div>
+  <div class="footer">
+    <a href="https://github.com/<?= repo ?>/actions" target="_blank">ดูสถานะ build บน GitHub →</a>
+  </div>
+<script>
+  const CORRELATION_ID = <?= JSON.stringify(correlationId) ?>;
+  const DRY_RUN = <?= dryRun ? 'true' : 'false' ?>;
+  const POLL_INTERVAL_MS = 5000;
+  const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+  const startedAt = Date.now();
+
+  function setStatus(html) {
+    document.getElementById('status').innerHTML = html;
   }
-  const grouped = {};
-  errors.forEach(e => {
-    const k = e.tab || '(ทั่วไป)';
-    (grouped[k] = grouped[k] || []).push(e);
-  });
-  let html = `<p>พบข้อผิดพลาด ${errors.length} จุด:</p>`;
-  Object.entries(grouped).forEach(([tab, errs]) => {
-    html += `<p><b>▸ ${tab}</b><ul>`;
-    errs.forEach(e => {
-      const field = e.field ? `<code>${e.field}</code>: ` : '';
-      html += `<li>${field}${e.message_th}</li>`;
+  function renderResultPanel(html) {
+    document.getElementById('result').innerHTML = html;
+    document.getElementById('status').innerHTML = '';
+  }
+
+  function poll() {
+    if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+      setStatus('⏳ ใช้เวลานานกว่าปกติ — ดูสถานะที่ลิงก์ด้านล่าง');
+      return;
+    }
+    google.script.run
+      .withSuccessHandler(handlePollResult)
+      .withFailureHandler(handlePollError)
+      .pollStatus(CORRELATION_ID);
+  }
+
+  function handlePollError(err) {
+    setStatus('⚠️ poll error: ' + (err && err.message) + ' — กำลังลองใหม่');
+    setTimeout(poll, POLL_INTERVAL_MS);
+  }
+
+  function handlePollResult(res) {
+    if (!res.found) {
+      setStatus('<span class="spinner"></span> รอ GitHub Action เริ่มงาน…');
+      setTimeout(poll, POLL_INTERVAL_MS);
+      return;
+    }
+    if (res.status !== 'completed') {
+      setStatus('<span class="spinner"></span> กำลังรันบน GitHub (' + res.status + ')…');
+      setTimeout(poll, POLL_INTERVAL_MS);
+      return;
+    }
+    if (res.conclusion === 'success') {
+      google.script.run
+        .withSuccessHandler(d => renderSuccess(d, res.htmlUrl))
+        .fetchResult(res.runId, 'sync-result');
+    } else {
+      google.script.run
+        .withSuccessHandler(e => renderError(e, res.htmlUrl))
+        .fetchResult(res.runId, 'sync-errors');
+    }
+  }
+
+  function renderSuccess(data, runUrl) {
+    if (!data || !data.changed_files || data.changed_files.length === 0) {
+      renderResultPanel('<p>✅ ' + (DRY_RUN ? 'ไม่มีอะไรจะเปลี่ยน — Sheets ตรงกับ dashboard แล้ว'
+                                            : 'Publish สำเร็จ (แต่ไม่มีไฟล์ที่ต้องอัปเดต)') + '</p>');
+      return;
+    }
+    const items = data.changed_files.map(f => '<li>' + f + '</li>').join('');
+    const verb = DRY_RUN ? 'จะมีการเปลี่ยนแปลง' : '✅ Publish สำเร็จ — เปลี่ยน';
+    renderResultPanel('<p>' + verb + ' ' + data.changed_files.length + ' ไฟล์:</p><ul>' + items + '</ul>');
+  }
+
+  function renderError(errors, runUrl) {
+    if (!errors || errors.length === 0) {
+      renderResultPanel('<p>❌ Publish ไม่สำเร็จ (ไม่ทราบสาเหตุ) — ดูรายละเอียดบน GitHub</p>');
+      return;
+    }
+    const grouped = {};
+    errors.forEach(e => {
+      const k = e.tab || '(ทั่วไป)';
+      (grouped[k] = grouped[k] || []).push(e);
     });
-    html += `</ul></p>`;
-  });
-  html += `<p>กรุณาแก้ไขใน Sheets แล้วลอง Publish ใหม่</p>`;
-  return html;
-}
+    let html = '<p>❌ พบข้อผิดพลาด ' + errors.length + ' จุด:</p>';
+    Object.entries(grouped).forEach(([tab, errs]) => {
+      html += '<div class="err-tab">▸ ' + tab + '</div><ul>';
+      errs.forEach(e => {
+        const f = e.field ? '<span class="err-field">' + e.field + ':</span> ' : '';
+        html += '<li>' + f + (e.message_th || e.message_en) + '</li>';
+      });
+      html += '</ul>';
+    });
+    html += '<p>กรุณาแก้ไขใน Sheets แล้วลอง Publish ใหม่</p>';
+    renderResultPanel(html);
+  }
+
+  setTimeout(poll, 2000); // wait briefly so the run can register
+</script>
+</body>
+</html>
 ```
 
-- [ ] **Step 2: Lint-check by reading through carefully**
+- [ ] **Step 3: Lint-check by reading through carefully**
 
-Verify that all referenced Script Properties (`GITHUB_PAT`, `SHEET_ID`, `REPO`) are documented in setup instructions. Verify that the HELP_URL placeholder is flagged for the developer to fill in.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add apps_script/Code.gs
-git commit -m "feat(sheets): Apps Script with Publish menu + correlation polling"
-```
-
----
-
-## Phase 5: Schema migration (React app)
-
-### Task 5.1: Drop `slide` and tighten `subtitle` in types.ts
-
-**Files:**
-- Modify: `web/src/types.ts`
-- Modify: `web/src/components/ChartCard.tsx`
-
-- [ ] **Step 1: Update types.ts**
-
-```typescript
-// web/src/types.ts
-export type Lang = 'th' | 'en'
-
-export interface Bilingual {
-  th: string
-  en: string
-}
-
-export interface ChartSeries {
-  key: string
-  name: Bilingual
-  color: string
-  values: (number | null)[]
-  emphasis?: boolean
-  exclude_from_stack?: boolean
-  is_cumulative?: boolean
-}
-
-export type ChartType = 'line' | 'stacked-bar' | 'clustered-bar'
-
-export interface ChartData {
-  id: string
-  section: 'education' | 'personnel' | 'research' | 'finance'
-  chart_type: ChartType
-  title: Bilingual
-  subtitle: Bilingual
-  categories_buddhist: string[]
-  series: ChartSeries[]
-  methodology: Bilingual
-  source: Bilingual
-}
-```
-
-- [ ] **Step 2: Simplify ChartCard.tsx — remove null branch on subtitle**
-
-In `web/src/components/ChartCard.tsx`, change the subtitle block from:
-
-```tsx
-{data.subtitle && (
-  <p className="mt-1 text-sm text-slate-500">{data.subtitle[lang]}</p>
-)}
-```
-
-to:
-
-```tsx
-<p className="mt-1 text-sm text-slate-500">{data.subtitle[lang]}</p>
-```
-
-- [ ] **Step 3: Verify TypeScript compiles**
-
-```bash
-cd web
-npm run build
-```
-Expected: build succeeds. The `slide` property still present in all 20 JSON
-files is harmless: Vite passes JSON through unchanged at runtime, and the
-existing imports don't trigger TypeScript's excess-property checks. Those
-stale `slide` keys are cleaned automatically the first time
-`sync_from_sheets.py` writes the JSON (Phase 6 / Phase 8).
+Verify all Script Properties (`GITHUB_PAT`, `SHEET_ID`, `REPO`, `HELP_URL`)
+are documented in the setup runbook (Task 7.1). Verify the `display_title`
+filter (not `name`). Verify the modal opens BEFORE polling starts so the
+"View on GitHub" fallback link is always available.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add web/src/types.ts web/src/components/ChartCard.tsx
-git commit -m "refactor(types): drop slide, require subtitle"
+git add apps_script/Code.gs apps_script/PublishModal.html
+git commit -m "feat(sheets): async Apps Script publish UX
+
+Server side opens the modal immediately after dispatching the GitHub
+workflow; the modal polls client-side via google.script.run, avoiding
+the Apps Script 6-minute execution cap and providing live progress.
+Polls filter workflow runs by display_title (which reflects run-name),
+not name."
 ```
 
 ---
 
-## Phase 6: Bootstrap script + manual integration test
+## Phase 5: Bootstrap script + manual integration test
 
-### Task 6.1: bootstrap_sheets.py
+*(Schema migration was completed in Phase 0.5 — see top of plan.)*
+
+### Task 5.1: bootstrap_sheets.py
 
 **Files:**
 - Create: `scripts/bootstrap_sheets.py`
@@ -1603,11 +1893,99 @@ def main():
     # 6) Delete default Sheet1 (safe — 23 other tabs exist by now)
     sh.del_worksheet(default_ws)
 
+    # 7) Apply protections + data validation + conditional formatting in
+    #    one batchUpdate per chart tab. This addresses Codex finding #7:
+    #    bootstrap promises guardrails — deliver them programmatically
+    #    instead of leaving them as manual follow-ups.
+    _apply_chart_tab_guardrails(sh, charts, chart_gid)
+    _apply_style_tab_protections(sh)
+
     print(f"Bootstrap complete: {len(charts) + 3} tabs created (INDEX + 2 STYLE + {len(charts)} charts).")
-    print("Manual follow-ups (not scripted to keep this tool minimal):")
-    print("  - Apply cell protection on locked ranges (rows 1, 13, 14 of each chart tab; STYLE tabs).")
-    print("  - Set data validation on year column (number 2500-2700).")
-    print("  - Add conditional formatting for duplicate years.")
+    print("Protections, data validation, and conditional formatting applied programmatically.")
+    print("If you ever need to clear them (e.g. before re-running bootstrap), do it in the Sheets UI:")
+    print("  - Data → Protect ranges → delete all")
+    print("  - Format → Conditional formatting → delete all rules")
+
+
+def _apply_chart_tab_guardrails(sh, charts, chart_gid):
+    """For every chart tab: protect locked rows (1, 13, 14), add year-range
+    data validation on column A from row 18, add 'numeric or empty' rule on
+    value columns, add conditional formatting for duplicate years."""
+    requests = []
+    for c in charts:
+        gid = chart_gid[c["id"]]
+        num_series = len(c["series"])
+        # Protect rows 1, 13, 14 (0-indexed: 0, 12, 13) across the whole tab width
+        for r in (0, 12, 13):
+            requests.append({
+                "addProtectedRange": {
+                    "protectedRange": {
+                        "range": {"sheetId": gid, "startRowIndex": r, "endRowIndex": r + 1},
+                        "description": "Locked — do not edit",
+                        "warningOnly": True,  # warning, not hard block, to keep dev's life easier
+                    }
+                }
+            })
+        # Year column (A) from row 18 onward — must be integer 2500-2700
+        requests.append({
+            "setDataValidation": {
+                "range": {"sheetId": gid, "startRowIndex": 17, "startColumnIndex": 0, "endColumnIndex": 1},
+                "rule": {
+                    "condition": {"type": "NUMBER_BETWEEN",
+                                  "values": [{"userEnteredValue": "2500"},
+                                             {"userEnteredValue": "2700"}]},
+                    "inputMessage": "ปี (พ.ศ.) ต้องเป็นตัวเลข 4 หลัก ระหว่าง 2500-2700",
+                    "strict": True,
+                }
+            }
+        })
+        # Value columns from row 18 — numeric OR blank (intentional null)
+        requests.append({
+            "setDataValidation": {
+                "range": {"sheetId": gid, "startRowIndex": 17,
+                          "startColumnIndex": 1, "endColumnIndex": 1 + num_series},
+                "rule": {
+                    "condition": {"type": "CUSTOM_FORMULA",
+                                  "values": [{"userEnteredValue": "=OR(ISNUMBER(B18),B18=\"\")"}]},
+                    "inputMessage": "ค่าต้องเป็นตัวเลขหรือว่างเปล่า",
+                    "strict": True,
+                }
+            }
+        })
+        # Conditional format: highlight duplicate year rows red
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{"sheetId": gid, "startRowIndex": 17, "startColumnIndex": 0, "endColumnIndex": 1}],
+                    "booleanRule": {
+                        "condition": {"type": "CUSTOM_FORMULA",
+                                      "values": [{"userEnteredValue": "=COUNTIF(A:A,A18)>1"}]},
+                        "format": {"backgroundColor": {"red": 0.99, "green": 0.85, "blue": 0.85}},
+                    }
+                },
+                "index": 0,
+            }
+        })
+    if requests:
+        sh.batch_update({"requests": requests})
+
+
+def _apply_style_tab_protections(sh):
+    """Protect the entire STYLE-charts and STYLE-series tabs."""
+    requests = []
+    for ws in sh.worksheets():
+        if ws.title.startswith("🎨 STYLE"):
+            requests.append({
+                "addProtectedRange": {
+                    "protectedRange": {
+                        "range": {"sheetId": ws.id},
+                        "description": "STYLE tab — dev-only",
+                        "warningOnly": True,
+                    }
+                }
+            })
+    if requests:
+        sh.batch_update({"requests": requests})
 
 
 if __name__ == "__main__":
@@ -1663,9 +2041,9 @@ git commit -m "feat(sync): one-shot bootstrap script for fresh Sheets workbook"
 
 ---
 
-## Phase 7: Documentation
+## Phase 6: Documentation
 
-### Task 7.1: Thai data-collector guide
+### Task 6.1: Thai data-collector guide
 
 **Files:**
 - Create: `docs/data-collector-guide-th.md`
@@ -1694,7 +2072,7 @@ git add docs/data-collector-guide-th.md
 git commit -m "docs: Thai guide for data collector"
 ```
 
-### Task 7.2: Architecture doc + README update + deprecation
+### Task 6.2: Architecture doc + README update + deprecation
 
 **Files:**
 - Create: `docs/architecture.md`
@@ -1736,9 +2114,9 @@ git commit -m "docs: architecture doc, README update, deprecate PPTX script"
 
 ---
 
-## Phase 8: Initial migration + e2e test (manual)
+## Phase 7: Initial migration + e2e test (manual)
 
-### Task 8.1: Hand-off checklist
+### Task 7.1: Hand-off checklist
 
 **Files:**
 - Create: `docs/runbook-initial-setup.md`
@@ -1747,21 +2125,32 @@ This task is documentation of the manual one-time steps from the spec's "Initial
 
 - [ ] **Step 1: Write runbook**
 
-Content:
-1. Create empty Google Sheets workbook → note Sheet ID
-2. Create GCP project + service account + JSON key
-3. Share Sheets with service account email (Editor)
-4. Generate fine-grained GitHub PAT (Contents: read, Actions: write)
-5. Add GitHub Secret `GOOGLE_SERVICE_ACCOUNT_JSON`
-6. Run `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path>`
-7. Apply Sheets-side protections/validations from manual checklist in bootstrap output
-8. Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs`
-9. Set Script Properties: `GITHUB_PAT`, `SHEET_ID`, `REPO`
-10. Reload Sheet, verify `📤 Publish to Dashboard` menu appears
-11. Run "Check what will change (dry-run)" — expect "no changes" (data matches JSON)
-12. Edit one cell, dry-run again — expect a diff
-13. Click "Publish all changes" — verify commit + GitHub Action success + dashboard update
-14. Hand the Sheet URL and the Thai guide URL to the data collector
+Content (numbered to match spec Initial Migration steps 0–5):
+
+1. **Step 0 — done in Phase 0.5 of this plan.** Verify the schema-cleanup
+   commit is on `main` before proceeding (`grep '"slide"' web/src/data/*.json`
+   should return nothing).
+2. Create empty Google Sheets workbook → note Sheet ID.
+3. Create GCP project + service account + JSON key. Share the Sheets file
+   with the service account email — **Viewer role** (the script only reads).
+4. Generate fine-grained GitHub PAT — **Contents: write, Actions: write**
+   (Contents: read is NOT enough; `repository_dispatch` requires write).
+5. Add GitHub Secret `GOOGLE_SERVICE_ACCOUNT_JSON`.
+6. Run `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path>`.
+7. Open Sheet → Extensions → Apps Script → paste BOTH `apps_script/Code.gs`
+   AND `apps_script/PublishModal.html`.
+8. Set Script Properties: `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`),
+   `HELP_URL` (link to the published Thai guide).
+9. Reload Sheet, verify `📤 Publish to Dashboard` menu appears.
+10. Run "Check what will change (dry-run)" — expect "no changes" (data
+    matches JSON because of Phase 0.5).
+11. Edit one cell, dry-run again — expect 1 file diff.
+12. Click "Publish all changes" — verify: commit on `main`, sync workflow
+    success, **deploy.yml triggered** (verify in Actions tab), and dashboard
+    actually updates on GitHub Pages.
+13. Read through the credential-trust-boundary section of the spec and
+    confirm you accept it.
+14. Hand the Sheet URL and the Thai guide URL to the data collector.
 
 - [ ] **Step 2: Commit**
 
@@ -1772,9 +2161,9 @@ git commit -m "docs: runbook for initial Sheets bootstrap"
 
 ---
 
-## Phase 9: Final sweep
+## Phase 8: Final sweep
 
-### Task 9.1: Full test run + lint
+### Task 8.1: Full test run + lint
 
 - [ ] **Step 1: Run all tests**
 
@@ -1809,7 +2198,17 @@ git push
 
 ## Notes on what's deferred
 
-- **Sheets-side conditional formatting and cell protection** are listed as manual setup steps in the bootstrap output. They can be automated later via `sh.batch_update()` if the manual setup proves error-prone.
-- **`build_chart_json.py` deletion** is intentionally deferred to after one successful production cycle of the new flow.
-- **Apps Script unit tests** are not part of this plan (Apps Script test infrastructure is awkward; integration test in Task 8.1 covers the critical paths).
-- **Adding new charts** (vs editing existing ones) remains a dev task per the spec's non-goals — covered by future plans if/when needed.
+- **`build_chart_json.py` deletion** is intentionally deferred to after one
+  successful production cycle of the new flow.
+- **Apps Script unit tests** are not part of this plan (Apps Script test
+  infrastructure is awkward). The integration test in Task 7.1 (steps 10-12)
+  covers the critical paths: dispatch, polling, success modal, error modal.
+- **Adding new charts** (vs editing existing ones) remains a dev task per
+  the spec's non-goals — covered by future plans if/when needed.
+- **GitHub App / Cloud Function alternative for the PAT.** Documented in
+  the spec's Authentication section as a future migration path if the
+  trust assumption ("single internal data collector, public data") ever
+  changes. Not implemented now.
+- **INDEX dynamic refresh on sync** was deliberately dropped — the service
+  account stays Viewer-only. INDEX is bootstrap-static; dev re-runs
+  bootstrap if a chart title changes and they want INDEX to reflect it.
