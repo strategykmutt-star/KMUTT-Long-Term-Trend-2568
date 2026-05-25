@@ -55,42 +55,51 @@ charts, end-to-end, by themselves — using only Google Sheets and a single
             │ Apps Script POSTs to GitHub API
             │ (repository_dispatch event)
             ▼
-┌────────────────────────┐
-│   GitHub Action:       │
-│   sync-from-sheets.yml │
-│   - reads Sheets via   │
-│     service account    │
-│   - validates          │
-│   - writes JSON        │
-│   - commits + pushes   │
-│   - explicitly dispatches│
-│     deploy.yml         │
-└───────────┬────────────┘
-            │ workflow_dispatch (NOT a plain push — see note below)
-            ▼
-┌────────────────────────┐
-│   deploy.yml (existing)│  Builds + deploys to GitHub Pages
-└───────────┬────────────┘
+┌────────────────────────────────────┐
+│   GitHub Action:                    │
+│   sync-from-sheets.yml              │
+│   Job 1 (sync):                     │
+│     - reads Sheets via service acct │
+│     - validates                     │
+│     - writes JSON                   │
+│     - commits + pushes (if changed) │
+│   Job 2 (deploy):                   │
+│     - npm ci + npm run build        │
+│     - upload-pages-artifact +       │
+│       deploy-pages                  │
+│     - ALWAYS runs after a           │
+│       non-dry-run sync (even on    │
+│       no-op, for recovery)         │
+└───────────┬────────────────────────┘
             ▼
        Live dashboard
+       (GitHub Pages)
+
+       The standalone deploy.yml workflow stays
+       as-is for manual deploys + non-sync
+       pushes to main.
 ```
 
-> **Why explicit dispatch, not implicit push trigger:** GitHub does not start
-> a downstream workflow when commits are pushed using the default
-> `GITHUB_TOKEN` (this is an anti-recursion safeguard, see
+> **Why deploy is inlined as a job, not chained via dispatch:** GitHub does
+> not start a downstream workflow when commits are pushed using the default
+> `GITHUB_TOKEN` (an anti-recursion safeguard, see
 > [docs](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication)).
-> So the sync workflow's `git push` would commit JSON but NOT trigger
-> `deploy.yml`. We work around this by also explicitly dispatching
-> `deploy.yml` from inside the sync workflow — `workflow_dispatch` and
-> `repository_dispatch` are exempt from the recursion guard. `deploy.yml`
-> must keep its `workflow_dispatch:` trigger (it already has one).
+> The first design tried to bridge this with `gh workflow run deploy.yml`,
+> but that requires `actions: write` AND introduces a two-workflow split
+> where the publish modal can falsely report success while the deploy run
+> is still queued (or has failed). Inlining the deploy as a job in the
+> sync workflow means: (a) one workflow run, one polling target, one
+> truth; (b) the modal only reports success after build+deploy finish;
+> (c) re-clicking Publish on a no-op edit still re-runs deploy, so a
+> stuck "repo updated but Pages not deployed" state is recoverable by
+> just clicking Publish again.
 
 **What is preserved:**
 
 - React/Vite/TypeScript app structure
 - `web/src/data/*.json` schema (consumer code unchanged)
-- Existing `deploy.yml` (the `workflow_dispatch:` trigger it already has
-  becomes load-bearing, not optional)
+- Existing `deploy.yml` (kept unchanged — still serves manual deploys
+  and non-sync pushes to main)
 - `build_chart_json.py` (kept for reference, deprecated)
 - The annual PPTX (continues as a separate deliverable)
 
@@ -184,8 +193,12 @@ FIN-income-expense-3yr
 
 **Conventions:**
 
-- 🔒 = locked (Sheets cell protection). Data collector cannot edit. Editing
-  STYLE-tab values that are derived from STYLE is also prohibited.
+- 🔒 = **hard-protected via Sheets API protected range with explicit
+  `editors` allowlist** = `[<dev-email>]`. The data collector is an
+  Editor of the workbook, so warning-only protection wouldn't block them;
+  the editors-allowlist mechanism does. Bootstrap collects the dev's
+  email via `--dev-email` CLI flag and writes it into each protected
+  range definition.
 - 📝 = editable, white background.
 - Locked cells have a light-grey background.
 - Freeze panes at row 17 so the header stays visible while scrolling years.
@@ -363,29 +376,44 @@ Failure (validation or workflow error):
    - Modal shows a "View run on GitHub" link from the moment it opens, so
      the user has a fallback even if polling fails.
 
-2. **GitHub Action `sync-from-sheets.yml`**
-   - Trigger: `repository_dispatch` with `event_type == sync-sheets`.
-   - Top-level `run-name: "Sync from Sheets [${{ github.event.client_payload.correlation_id }}]"`
-     so Apps Script can locate the run via `display_title`.
-   - Steps:
-     1. checkout → setup Python → `pip install -r requirements-dev.txt`
-     2. Write `GOOGLE_SERVICE_ACCOUNT_JSON` secret to a temp file
-     3. `python scripts/sync_from_sheets.py --sheet-id "$SHEET_ID" [--dry-run] --result-out result.json --errors-out errors.json`
-     4. If exit code 0: upload `result.json` as artifact `sync-result`. On
-        non-dry-run runs with `result.changed_files` non-empty:
-        `git add web/src/data/*.json`,
-        `git commit -m "Sync from Sheets by $USER_EMAIL at $TIMESTAMP"`,
-        `git push`. **Idempotency:** if `changed_files` is empty, skip the
-        commit entirely (no empty commit on no-op publishes).
-     5. **Explicitly dispatch deploy.yml** so it actually runs. The plain
-        push from step 4 does NOT trigger `deploy.yml` because GitHub's
-        `GITHUB_TOKEN` is exempt from kicking off downstream workflows.
-        Use `gh workflow run deploy.yml --ref main` (the GitHub CLI is
-        pre-installed on `ubuntu-latest`). Skipped if `changed_files` was
-        empty.
-     6. If exit code 1: upload `errors.json` as artifact `sync-errors` and
-        fail the workflow (exit 1) so Apps Script sees the failure
-        conclusion.
+2. **GitHub Action `sync-from-sheets.yml`** — two jobs in one workflow run.
+
+   **Top-level configuration:**
+   - Trigger: `repository_dispatch` with `event_type == sync-sheets`
+   - `run-name: "Sync from Sheets [${{ github.event.client_payload.correlation_id }}]"`
+   - `permissions: contents: write, pages: write, id-token: write,
+     actions: read` (the `pages` and `id-token` permissions are required
+     by the deploy job)
+
+   **Job 1 — `sync`:**
+   1. checkout → setup Python → `pip install -r requirements-dev.txt`
+   2. Write `GOOGLE_SERVICE_ACCOUNT_JSON` secret to a temp file
+   3. `python scripts/sync_from_sheets.py --sheet-id "$SHEET_ID" [--dry-run] --result-out result.json --errors-out errors.json`
+   4. If exit code 0: upload `result.json` as artifact `sync-result`. On
+      non-dry-run runs with `result.changed_files` non-empty:
+      `git add web/src/data/*.json`,
+      `git commit -m "Sync from Sheets by $USER_EMAIL at $TIMESTAMP"`,
+      `git push`. **Idempotency:** if `changed_files` is empty, skip the
+      commit entirely (no empty commit on no-op publishes).
+   5. If exit code 1: upload `errors.json` as artifact `sync-errors` and
+      fail the workflow (exit 1) so Apps Script sees the failure
+      conclusion.
+
+   **Job 2 — `deploy`:**
+   - `needs: sync`, `if: success() && github.event.client_payload.dry_run != true`
+     — runs ALWAYS on a successful non-dry-run sync, even when no JSON
+     files changed (no-op publish should still re-deploy, so the data
+     collector can recover a "repo updated but Pages stale" state by just
+     clicking Publish again).
+   - Replicates the build/deploy steps from the existing `deploy.yml`
+     (checkout → setup-node → npm ci → npm run build → upload-pages-artifact
+     → deploy-pages). Kept inline rather than calling `deploy.yml` via
+     `workflow_call` to avoid permission-inheritance ambiguity.
+
+   The Apps Script modal polls the parent workflow run; the run's
+   `status=completed` only fires after BOTH jobs finish. The modal's
+   "success" message is therefore only shown when the Pages deploy has
+   actually completed.
 
 3. **`scripts/sync_from_sheets.py`**
    - CLI: `--sheet-id`, `--dry-run` (no writes), `--result-out PATH`,
@@ -416,9 +444,9 @@ Failure (validation or workflow error):
        INDEX tab** — INDEX is static after bootstrap (the service account
        has Viewer-only access; no write path needed).
 
-4. **`deploy.yml` (existing)** — triggered explicitly via `gh workflow run`
-   from step 5 of the sync workflow. Its `workflow_dispatch:` trigger
-   (already present from initial scaffolding) becomes load-bearing.
+4. **`deploy.yml` (existing)** — unchanged. It continues to handle non-sync
+   pushes to `main` and manual `workflow_dispatch` deploys. The sync
+   workflow does NOT call it.
 
 ## Validation
 
@@ -434,7 +462,7 @@ Conditional Formatting:
 | Year column is 4-digit Buddhist year (2500–2700) | Data validation: number range | Reject input + tooltip |
 | Value cells are numeric **or empty** | Data validation: `=OR(ISNUMBER(A1),A1="")` | Reject input |
 | No duplicate years | Conditional format: highlight duplicates | Red cell (warning, not blocked) |
-| Required text fields not empty (rows 3, 4, 8, 9, 10, 11) | Conditional format: ISBLANK | Red cell border |
+| Required text fields not empty (rows 3, 4, 5, 6, 8, 9, 10, 11 — title TH/EN, subtitle TH/EN, methodology TH/EN, source TH/EN) | Conditional format: ISBLANK | Red cell border |
 
 **Note on intentional `null` values.** 5 of the 20 current charts (patents,
 programs, staff-total, research-funding, research-funding-3yr) contain
@@ -532,6 +560,20 @@ for cid in STYLE_CHARTS:
     if cid not in {d["id"] for d in parsed_charts.values()}:
         errors.append(f"missing chart tab for '{cid}' (declared in STYLE-charts)")
 
+# Cross-check: every (chart_id, series_key) declared in STYLE-series must
+# appear in the corresponding chart tab. This prevents a data collector
+# from accidentally deleting a series header (which would otherwise produce
+# series:[...] missing the key, crashing the React app's KpiCard).
+expected_by_chart = {}
+for cid, sk in STYLE_SERIES:
+    expected_by_chart.setdefault(cid, set()).add(sk)
+for tab, data in parsed_charts.items():
+    cid = data["id"]
+    actual = {s["key"] for s in data["series"] if s["key"].strip()}
+    for missing_sk in expected_by_chart.get(cid, set()) - actual:
+        errors.append(f"{tab}: series '{missing_sk}' declared in STYLE-series "
+                      f"but missing from chart tab")
+
 if errors:
     write_errors_json(errors, args.errors_out)
     sys.exit(1)
@@ -554,14 +596,14 @@ if errors:
 Two independent credentials, set up once.
 
 **Apps Script → GitHub:** Fine-grained Personal Access Token, scoped to this
-repo only, with `Contents: write` and `Actions: write` permissions.
+repo only, with `Contents: write` and `Actions: read` permissions.
 
 - `Contents: write` is required by the
   [`POST /repos/{owner}/{repo}/dispatches`](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event)
-  endpoint. (`read` is not enough — `repository_dispatch` is classified as a
-  Contents-write operation.)
-- `Actions: write` allows the Apps Script to also dispatch deploy.yml as a
-  fallback if the sync workflow's own dispatch step fails.
+  endpoint. (`read` is not enough — `repository_dispatch` is classified as
+  a Contents-write operation.)
+- `Actions: read` is required to poll workflow runs and download artifacts
+  (sync-result, sync-errors).
 - Stored in Apps Script Script Properties as `GITHUB_PAT`. Never committed.
 
 **Credential trust boundary (important).** The Apps Script is a
@@ -588,10 +630,18 @@ adversarial environment), migrate to one of:
 Sheets API in a Google Cloud project, create a service account, download the
 JSON key, share the Sheets file with the service account's email.
 
-- **Role:** Viewer is sufficient. The action reads but never writes to the
-  Sheet. (Earlier draft suggested the action would refresh the INDEX tab —
-  that idea is dropped; INDEX is now created by `bootstrap_sheets.py` and
-  is static. See "Sheet Schema" section.)
+- **Role: Editor** (initially required by `bootstrap_sheets.py`, which
+  creates/deletes tabs, writes values, and applies protections/validation
+  via `batchUpdate`). After bootstrap completes successfully, the operator
+  **may downgrade the service account to Viewer** for least-privilege
+  runtime, since `sync_from_sheets.py` only reads. The runbook documents
+  this as an optional hardening step.
+- The trade-off: leaving the service account as Editor means a leaked
+  service-account key would allow writes to the workbook (vandalism is
+  recoverable from Google Drive's 30-day trash). Downgrading to Viewer
+  closes that gap at the cost of needing to re-grant Editor before any
+  future bootstrap re-run. Acceptable either way; default is "downgrade
+  after bootstrap" because it's a single click in Sheets UI.
 - Store the full JSON in GitHub Secrets as `GOOGLE_SERVICE_ACCOUNT_JSON`.
 
 Both credentials are long-lived and do not require routine rotation.
@@ -605,11 +655,13 @@ because every JSON file still carries the legacy `slide` key.
 | Step | Time | Action |
 |---|---|---|
 | **0** | **5 min** | **Schema-cleanup commit on `main`:** strip the `slide` key from all 20 `web/src/data/*.json` files (e.g. `jq 'del(.slide)' file.json` or a small Python one-liner). Update `web/src/types.ts` to drop `slide: number` and change `subtitle: Bilingual | null` to `subtitle: Bilingual`. Update `web/src/components/ChartCard.tsx` to remove the now-unnecessary `{data.subtitle && ...}` null check. Run `npm run build` to confirm. Commit and push. This is a no-op for end-users; it just makes the post-bootstrap JSON byte-identical to the pre-bootstrap JSON, so subsequent dry-runs report 0 changes (proving the round-trip works). |
-| 1 | 5 min | Create empty Google Sheets named "KMUTT Trends — Data Source". Note Sheet ID. Create GCP project + service account, download JSON key, share Sheet with service account email (Viewer role). Generate fine-grained GitHub PAT (Contents: write, Actions: write). |
-| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting, cell protection, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
-| 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` AND `apps_script/PublishModal.html` → set Script Properties `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`). Reload Sheet; verify `📤 Publish` menu appears. |
+| 1 | 5 min | Create empty Google Sheets named "KMUTT Trends — Data Source". Note Sheet ID. Create GCP project + service account, download JSON key, share Sheet with service account email — **Editor role** (bootstrap needs write). Also share with the data collector (Editor) and any other dev maintainers (Editor). Generate fine-grained GitHub PAT (Contents: write, Actions: read). |
+| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path> --dev-email <dev's google account>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting for required text fields and duplicate years, **hard-protected ranges with `editors=[dev-email]`**, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
+| 2b | 1 min | (Optional hardening) In the Sheets share dialog, **downgrade the service account from Editor to Viewer**. After this, future bootstrap re-runs require restoring Editor temporarily. |
+| 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` AND `apps_script/PublishModal.html` → set Script Properties `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`), `HELP_URL`. Reload Sheet; verify `📤 Publish` menu appears. |
 | 4 | 5 min | In GitHub repo: add Secret `GOOGLE_SERVICE_ACCOUNT_JSON`, commit `.github/workflows/sync-from-sheets.yml` and `scripts/sync_from_sheets.py`. |
-| 5 | 5 min | Sanity check: click "Check what will change (dry-run)" — should report no diff (data matches JSON because step 0 cleaned up the schema). Edit one cell, dry-run again — should show 1 file diff. Click "Publish all changes" — verify commit + dispatch + deploy + live dashboard update. |
+| 5 | 5 min | Sanity check: click "Check what will change (dry-run)" — should report no diff (data matches JSON because step 0 cleaned up the schema). Edit one cell, dry-run again — should show 1 file diff. Click "Publish all changes" — verify: sync job commits, deploy job builds + deploys, modal reports success only after BOTH finish, live dashboard updates. |
+| 5b | 2 min | Test recovery path: click Publish a second time without editing. Modal should still complete (sync no-op, deploy re-runs), dashboard should re-publish identical content. |
 
 After step 5, hand off to the data collector with `docs/data-collector-guide-th.md`.
 
@@ -702,6 +754,40 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
   Server-side polling was incompatible with the Apps Script 6-minute
   execution cap; the new UX runs polling client-side in the modal's
   browser context, with short server-side RPCs per poll.
+
+## Resolved decisions (round 4 — Codex external review)
+
+- **Deploy is inlined as a job in the sync workflow**, not chained via
+  `gh workflow run`. Two-workflow chain caused two problems: (a) needed
+  `actions: write` (was set to `read`), and (b) the modal could report
+  success while deploy was still queued or had failed. Single workflow
+  with sync + deploy jobs makes the modal honest about end-to-end state.
+- **Deploy job always runs on a non-dry-run sync**, even when no JSON
+  files changed. This gives the data collector a recovery path for the
+  "repo updated but Pages stale" stuck state — just click Publish again.
+- **PAT scope corrected from `Actions: write` to `Actions: read`.** The
+  Apps Script no longer dispatches anything; it only polls runs and
+  downloads artifacts.
+- **Service account starts as Editor** (bootstrap requires it). Optional
+  step 2b in Initial Migration downgrades to Viewer after bootstrap.
+- **Protected ranges use editors-allowlist, not warningOnly.** With the
+  data collector as a workbook Editor, warning-only protections still
+  let them edit after clicking through the warning. Hard protection with
+  `editors=[dev-email]` actually blocks them. Bootstrap takes `--dev-email`.
+- **Validator checks STYLE-series → chart-tab completeness.** For each
+  (chart_id, series_key) declared in STYLE-series, the chart tab must
+  contain that series. Without this, a data collector blanking the entire
+  series header row would publish `series:[]` — and the React app's
+  KpiCard does `series.values` directly, so the dashboard would crash.
+- **Bootstrap implements the full Layer-1 conditional formatting set**
+  promised by the spec — duplicate years AND blank-required-text rules
+  for rows 3–6, 8–11 (title/subtitle/methodology/source TH+EN).
+- **INDEX schema trimmed** to Chart ID, Section, Title TH/EN, Jump — the
+  `# years` and `# series` columns are removed because they can't be
+  refreshed (INDEX is bootstrap-static; service account is Viewer).
+- **Test fixture color fixed** from `#000` to `#000000` so
+  `test_valid_chart_produces_no_errors` actually passes the hex-format
+  validator added in round 3.
 
 ## Effort Estimate
 
