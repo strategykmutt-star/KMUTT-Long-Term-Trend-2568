@@ -2048,8 +2048,19 @@ def main():
     #    one batchUpdate per chart tab. Hard protection (editors-allowlist)
     #    not warning-only — the data collector is a workbook Editor, so
     #    warningOnly wouldn't block them.
-    _apply_chart_tab_guardrails(sh, charts, chart_gid, [args.dev_email])
-    _apply_style_tab_protections(sh, [args.dev_email])
+    #
+    # Editors list MUST include the service account email alongside the
+    # dev. Sheets API enforces editor membership for protected-range
+    # deletion: a general workbook Editor cannot remove a protected range
+    # whose `editors.users` list doesn't include them. Without the service
+    # account on this list, _reset_workbook_state() on a re-run would
+    # error out trying to drop these ranges. The service account's email
+    # lives in the credentials JSON as `client_email`.
+    import json as _json
+    sa_email = _json.loads(Path(args.credentials).read_text())["client_email"]
+    allowed_editors = [args.dev_email, sa_email]
+    _apply_chart_tab_guardrails(sh, charts, chart_gid, allowed_editors)
+    _apply_style_tab_protections(sh, allowed_editors)
 
     print(f"Bootstrap complete: {len(charts) + 3} tabs created (INDEX + 2 STYLE + {len(charts)} charts).")
     print("Protections, data validation, and conditional formatting applied programmatically.")

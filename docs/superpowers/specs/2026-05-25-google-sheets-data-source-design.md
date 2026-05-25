@@ -405,6 +405,13 @@ Failure (validation or workflow error):
      files changed (no-op publish should still re-deploy, so the data
      collector can recover a "repo updated but Pages stale" state by just
      clicking Publish again).
+   - `concurrency: { group: pages, cancel-in-progress: false }` —
+     **MUST** match the group used by the existing `deploy.yml`. Without
+     this, a sync-triggered deploy could race a manual or push-triggered
+     deploy, and whichever finishes last overwrites Pages with its
+     artifact — possibly stale — while the publish modal has already
+     reported success. Workflow-level group `sync-from-sheets` separately
+     serializes sync runs themselves.
    - Replicates the build/deploy steps from the existing `deploy.yml`
      (checkout → setup-node → npm ci → npm run build → upload-pages-artifact
      → deploy-pages). Kept inline rather than calling `deploy.yml` via
@@ -477,9 +484,13 @@ false-flagged every baseline chart.
 data-validation rules above and the cell protections listed below
 programmatically via Sheets API `batchUpdate`. The conditional-formatting
 rules (duplicate years, blank-required-fields) are also set
-programmatically. If the bootstrap fails partway and re-running creates
-duplicate rules, the operator can clear formatting in Sheets UI and
-re-run.
+programmatically. The script is **idempotent**: re-runs first drop all
+existing protected ranges and conditional format rules via a reset helper,
+then rebuild from scratch. No manual Sheets-UI cleanup is required between
+runs. (To enable this, the service account email is included in every
+protected range's `editors.users` list alongside the dev's email; without
+that, Sheets API would deny the service account permission to delete
+ranges it didn't create.)
 
 ### Layer 2 — Python script before commit
 
@@ -487,13 +498,26 @@ re-run.
 if any chart fails, no JSON is written for any chart. The dashboard never sees
 a half-broken state.
 
-**Important parser contract for the validator to work.** The parser
-**must preserve column positions** of row 14 (series_key row). It must
-NOT silently drop blank cells. If row 14 has `[bachelor, "", graduate,
-total]` (with column C blank), the parser returns a series list with
-four entries, one of which has an empty key; the validator then catches
-the empty cell. If the parser collapsed the list to three entries, the
-data columns would silently shift to align with the wrong series.
+**Important parser contracts for the validator to work.**
+
+1. **Preserve column positions in row 14** (series_key row). The parser
+   must NOT silently drop blank cells. If row 14 has
+   `[bachelor, "", graduate, total]` (with column C blank), the parser
+   returns a series list with four entries, one of which has an empty
+   key; the validator then catches the empty cell. If the parser
+   collapsed the list to three entries, the data columns would silently
+   shift to align with the wrong series.
+
+2. **Hard-fail on blank year with data.** If a data row's column A
+   (year) is blank but any value cell in B+ is populated, the parser
+   must raise (e.g. `ValueError`) rather than skip the row. Silently
+   dropping such a row would erase a year's worth of data from the
+   dashboard with no warning — and the validator can never catch what
+   the parser already threw away. The orchestrator catches the
+   exception and records it as a parse_error so the publish fails
+   all-or-nothing. Truly empty rows (year blank AND all value cells
+   blank) are still skipped silently — this is how trailing empty
+   rows in the sheet are tolerated.
 
 ```python
 # pseudo (operates on ChartData dicts produced by the parser)
@@ -583,6 +607,10 @@ if errors:
 
 - **Deleted chart tab** → if a `chart_id` exists in STYLE but no tab matches,
   fail with `"missing tab for chart X"`. Prevents accidental loss.
+- **Blanked year cell with data still in row** → parser raises; orchestrator
+  surfaces as a parse error; publish fails all-or-nothing. The data is
+  preserved in the sheet (not lost) and the data collector is told which
+  row needs fixing. See "Important parser contracts" above.
 - **New non-chart tab** → tabs prefixed with `_` (e.g. `_scratch`) are
   ignored. Anything else without a section prefix triggers a warning but does
   not fail.
