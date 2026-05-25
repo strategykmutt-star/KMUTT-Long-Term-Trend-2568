@@ -133,24 +133,53 @@ the new round-trip is byte-stable.
 - Modify: `web/src/types.ts`
 - Modify: `web/src/components/ChartCard.tsx`
 
-- [ ] **Step 1: Write a one-shot Python script to strip `slide`**
+- [ ] **Step 1: Create a one-shot strip script (works on Windows + Unix)**
 
-```bash
-python - <<'EOF'
+Create `scripts/_strip_slide.py`:
+
+```python
+"""One-time: strip the legacy `slide` field from all chart JSON files
+ahead of the Sheets-driven sync. Runs identically on PowerShell, cmd,
+bash, etc. — no shell heredoc required.
+
+Idempotent: re-running on already-stripped files is a no-op."""
 import json
 from pathlib import Path
-for p in sorted(Path("web/src/data").glob("*.json")):
-    obj = json.loads(p.read_text(encoding="utf-8"))
-    obj.pop("slide", None)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"stripped slide from {p.name}")
-EOF
+
+DATA_DIR = Path("web/src/data")
+
+def main():
+    stripped = 0
+    for p in sorted(DATA_DIR.glob("*.json")):
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if "slide" in obj:
+            obj.pop("slide")
+            p.write_text(
+                json.dumps(obj, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            stripped += 1
+            print(f"stripped slide from {p.name}")
+        else:
+            print(f"  ({p.name} already clean)")
+    print(f"Done: {stripped} file(s) modified.")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it:
+
+```bash
+python scripts/_strip_slide.py
 ```
 
 - [ ] **Step 2: Verify no `slide` keys remain**
 
+Run a tiny Python check (works in any shell):
+
 ```bash
-grep -l '"slide"' web/src/data/*.json || echo "all clean"
+python -c "import json,glob,sys; bad=[p for p in glob.glob('web/src/data/*.json') if 'slide' in json.load(open(p,encoding='utf-8'))]; print('LEFTOVERS:',bad) if bad else print('all clean'); sys.exit(1 if bad else 0)"
 ```
 Expected: `all clean`.
 
@@ -217,13 +246,37 @@ Expected: build succeeds with no errors.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add web/src/data/ web/src/types.ts web/src/components/ChartCard.tsx
-git commit -m "refactor: drop legacy slide field, require subtitle
+git add web/src/data/ web/src/types.ts web/src/components/ChartCard.tsx scripts/_strip_slide.py
+```
 
-Migration commit ahead of Sheets-driven sync. The slide field was a
-PPTX-era artefact unused by the React app; subtitle was always non-null
-in practice. Tightening both makes the post-bootstrap JSON byte-identical
-to what sync_from_sheets.py will produce."
+Then commit using a HEREDOC (bash/Git Bash) or PowerShell here-string
+(PowerShell). Both work because the message is multi-line.
+
+Bash / Git Bash:
+```bash
+git commit -m "$(cat <<'EOF'
+refactor: drop legacy slide field, require subtitle, reformat JSON
+
+The strip script re-emits every JSON file with indent=2 and a trailing
+newline — the diff is large by line count but the only semantic change
+is removing the `slide` field from every chart. The writer in
+sync_from_sheets.py uses the same indent + trailing newline, so the
+first dry-run after bootstrap reports zero changed files.
+EOF
+)"
+```
+
+PowerShell:
+```powershell
+git commit -m @'
+refactor: drop legacy slide field, require subtitle, reformat JSON
+
+The strip script re-emits every JSON file with indent=2 and a trailing
+newline — the diff is large by line count but the only semantic change
+is removing the `slide` field from every chart. The writer in
+sync_from_sheets.py uses the same indent + trailing newline, so the
+first dry-run after bootstrap reports zero changed files.
+'@
 ```
 
 ---
@@ -584,6 +637,34 @@ def test_parse_chart_tab_skips_completely_blank_rows():
     result = parse_chart_tab(rows, style_charts, style_series)
     # Only 4 years now (2564, 2565, 2566, 2567)
     assert result["categories_buddhist"] == ["2564", "2565", "2566", "2567"]
+
+def test_parse_chart_tab_detects_deleted_metadata_row():
+    """Critical: if a user deletes a metadata row (e.g. Name TH), every
+    row below shifts up by one. The parser would otherwise silently read
+    Name EN as data values. Sentinel check at A17 must catch this."""
+    rows = load("students-all-rows.json")
+    # Simulate "Name TH" row (0-idx 14) being deleted
+    del rows[14]
+    style_charts = parse_style_charts(load("style-charts-rows.json"))
+    style_series = parse_style_series(load("style-series-rows.json"))
+
+    with pytest.raises(ValueError, match="expected 'Year"):
+        parse_chart_tab(rows, style_charts, style_series)
+
+def test_parse_chart_tab_accepts_year_range_strings():
+    """The 3yr charts use NNNN-NNNN year ranges. Parser must accept them
+    as strings (validator checks the format)."""
+    rows = load("students-all-rows.json")
+    # Replace all year cells with range strings
+    for i, y in enumerate(["2536-2538", "2539-2541", "2542-2544", "2545-2547", "2548-2550"]):
+        rows[17 + i][0] = y
+    style_charts = parse_style_charts(load("style-charts-rows.json"))
+    style_series = parse_style_series(load("style-series-rows.json"))
+
+    result = parse_chart_tab(rows, style_charts, style_series)
+    assert result["categories_buddhist"] == [
+        "2536-2538", "2539-2541", "2542-2544", "2545-2547", "2548-2550"
+    ]
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -600,6 +681,7 @@ for empty keys is skipped (those are reported by the validator).
 ```python
 # Append to scripts/lib/parsers.py
 DATA_START_ROW = 17  # 0-indexed: row 18 in spec = index 17
+YEAR_HEADER_ROW = 16  # 0-indexed: row 17 in spec = "Year (พ.ศ.)"
 
 
 def parse_chart_tab(
@@ -611,11 +693,28 @@ def parse_chart_tab(
 
     Preserves column positions in the series_key row so the validator can
     detect blank/duplicate keys instead of silently shifting data columns.
+    Verifies a sentinel cell (A17 = "Year ...") to catch the case where
+    the data collector deleted an entire metadata row (which would shift
+    all rows below and silently misalign the parser).
     """
     chart_id = rows[0][1].strip()
     style_c = style_charts.get(chart_id)
     if style_c is None:
         raise KeyError(f"Chart id '{chart_id}' missing from STYLE-charts")
+
+    # Sanity check: the row that should hold "Year (พ.ศ.)" must actually do so.
+    # If not, rows were deleted/shifted; refuse to read further so we don't
+    # silently publish garbage (e.g. reading Name EN as data values).
+    if YEAR_HEADER_ROW >= len(rows):
+        raise ValueError(f"chart tab has fewer than {YEAR_HEADER_ROW + 1} rows — "
+                         f"required metadata rows are missing")
+    year_header = rows[YEAR_HEADER_ROW][0].strip() if rows[YEAR_HEADER_ROW] else ""
+    if not year_header.lower().startswith("year"):
+        raise ValueError(
+            f"expected 'Year (พ.ศ.)' header at A17, got '{year_header}'. "
+            f"This usually means a row was accidentally deleted; please "
+            f"undo and try again."
+        )
 
     def cell(r: int) -> str:
         return rows[r][1].strip() if len(rows[r]) > 1 else ""
@@ -865,6 +964,38 @@ def test_kpi_series_key_not_in_chart_flagged():
     style_series = {("students-all", "bachelor"): {"color": "#000000", "flags": []}}
     errors = validate({"EDU-students-all": GOOD_CHART}, style_charts, style_series)
     assert any("kpi_series_key 'phantom'" in e["message_en"] for e in errors)
+
+def test_year_range_string_accepted():
+    """The *-3yr charts use NNNN-NNNN year ranges. These must validate."""
+    chart = {**GOOD_CHART,
+             "categories_buddhist": ["2536-2538", "2539-2541", "2542-2544"]}
+    # Adjust series values to match year count
+    chart["series"] = [{**chart["series"][0], "values": [1, 2, 3]}]
+    errors = validate({"EDU-students-all": chart}, STYLE_CHARTS, STYLE_SERIES)
+    assert errors == []
+
+def test_year_range_with_endpoint_out_of_range_flagged():
+    chart = {**GOOD_CHART, "categories_buddhist": ["2536-9999"]}
+    chart["series"] = [{**chart["series"][0], "values": [1]}]
+    errors = validate({"EDU-students-all": chart}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("outside" in e["message_en"] for e in errors)
+
+def test_year_range_start_greater_than_end_flagged():
+    chart = {**GOOD_CHART, "categories_buddhist": ["2566-2564"]}
+    chart["series"] = [{**chart["series"][0], "values": [1]}]
+    errors = validate({"EDU-students-all": chart}, STYLE_CHARTS, STYLE_SERIES)
+    assert any("start > end" in e["message_en"] for e in errors)
+
+def test_duplicate_chart_id_across_tabs_flagged():
+    """Critical: prevents silent overwrite when user duplicates a tab.
+    Two different tabs both claim chart_id='students-all' — write_charts
+    would silently overwrite one with the other."""
+    errors = validate(
+        {"EDU-students-all": GOOD_CHART, "EDU-students-all-copy": GOOD_CHART},
+        STYLE_CHARTS, STYLE_SERIES,
+    )
+    assert any("duplicate chart_id" in e["message_en"] and "students-all" in e["message_en"]
+               for e in errors)
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -889,7 +1020,16 @@ REQUIRED_TEXT_FIELDS = [
 ]
 ALLOWED_FLAGS = {"emphasis", "exclude_from_stack", "is_cumulative"}
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+# Year cell may be a plain 4-digit BE year OR a NNNN-NNNN BE range
+# (the *-3yr charts and patents row 1 use range format).
+YEAR_RE = re.compile(r"^(\d{4})(?:-(\d{4}))?$")
 YEAR_MIN, YEAR_MAX = 2500, 2700
+
+
+def year_sort_key(y: str) -> int:
+    """Sort years by their start year so ranges and plain years interleave."""
+    m = YEAR_RE.match(y)
+    return int(m.group(1)) if m else -1
 
 
 def _err(tab: str | None, field: str | None, th: str, en: str) -> ValidationError:
@@ -915,20 +1055,27 @@ def validate(
         if len(set(years)) != len(years):
             errors.append(_err(tab, "categories_buddhist",
                 "ปีในตารางซ้ำกัน", "duplicate years in data table"))
-        if years != sorted(years):
+        if years != sorted(years, key=year_sort_key):
             errors.append(_err(tab, "categories_buddhist",
-                "ปีไม่ได้เรียงจากน้อยไปมาก", "years not sorted ascending"))
+                "ปีไม่ได้เรียงจากน้อยไปมาก (ตาม start-year)",
+                "years not sorted ascending (by start-year)"))
         for y in years:
-            try:
-                yi = int(y)
-                if yi < YEAR_MIN or yi > YEAR_MAX:
-                    errors.append(_err(tab, "categories_buddhist",
-                        f"ปี '{y}' อยู่นอกช่วง {YEAR_MIN}-{YEAR_MAX}",
-                        f"year '{y}' outside {YEAR_MIN}-{YEAR_MAX}"))
-            except ValueError:
+            m = YEAR_RE.match(y)
+            if not m:
                 errors.append(_err(tab, "categories_buddhist",
-                    f"ปี '{y}' ไม่ใช่จำนวนเต็ม",
-                    f"year '{y}' is not an integer"))
+                    f"ปี '{y}' ไม่ใช่ปี 4 หลัก หรือช่วงปี NNNN-NNNN",
+                    f"year '{y}' not a 4-digit BE year or NNNN-NNNN range"))
+                continue
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else start
+            if not (YEAR_MIN <= start <= YEAR_MAX and YEAR_MIN <= end <= YEAR_MAX):
+                errors.append(_err(tab, "categories_buddhist",
+                    f"ปี '{y}' อยู่นอกช่วง {YEAR_MIN}-{YEAR_MAX}",
+                    f"year '{y}' outside {YEAR_MIN}-{YEAR_MAX}"))
+            if m.group(2) and start > end:
+                errors.append(_err(tab, "categories_buddhist",
+                    f"ช่วงปี '{y}' มีต้น > ปลาย",
+                    f"year range '{y}' has start > end"))
 
         # Column-position-preserving series_key check: blanks ARE reported
         # (the parser keeps them as empty strings; we surface them here).
@@ -989,6 +1136,19 @@ def validate(
             errors.append(_err(None, "tab",
                 f"ไม่พบ tab สำหรับกราฟ '{cid}' (อยู่ใน STYLE-charts)",
                 f"missing chart tab for '{cid}' (declared in STYLE-charts)"))
+
+    # Cross-check: no two chart tabs may have the same chart_id (e.g. data
+    # collector duplicated a tab in Sheets and renamed it). Without this,
+    # write_charts() would silently overwrite one chart's JSON with another.
+    seen_ids: dict[str, str] = {}
+    for tab, data in parsed_charts.items():
+        cid = data["id"]
+        if cid in seen_ids:
+            errors.append(_err(tab, "chart_id",
+                f"chart_id '{cid}' ซ้ำกับ tab '{seen_ids[cid]}'",
+                f"duplicate chart_id '{cid}' (also in tab '{seen_ids[cid]}')"))
+        else:
+            seen_ids[cid] = tab
 
     # Cross-check: every series declared in STYLE-series must exist in its
     # chart tab. Without this, blanking the entire row-14 header would
@@ -1120,10 +1280,13 @@ def write_charts(charts: list[ChartData], out_dir: Path) -> list[str]:
             existing = json.loads(target.read_text(encoding="utf-8"))
             if json_equal(existing, chart):
                 continue
-        # We write WITHOUT sort_keys so the file matches the natural order
+        # Write WITHOUT sort_keys so the file matches the natural order
         # callers prefer; equality check uses sort_keys for stability.
+        # Append "\n" to match the Phase 0.5 strip-script output — without
+        # this, the first sync after schema-cleanup would diff every file
+        # purely on trailing-newline mismatch.
         target.write_text(
-            json.dumps(chart, ensure_ascii=False, indent=INDENT),
+            json.dumps(chart, ensure_ascii=False, indent=INDENT) + "\n",
             encoding="utf-8",
         )
         changed.append(filename)
@@ -1482,9 +1645,28 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
-      - name: Write service account credentials
+      - name: Preflight — required config present
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
         run: |
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > /tmp/gcp-key.json
+          if [ -z "$SHEET_ID" ]; then
+            # Write a structured errors.json so the Apps Script modal can
+            # render a meaningful message instead of "ไม่ทราบสาเหตุ".
+            cat > errors.json <<'EOF'
+          [{"tab":null,"field":"config","message_th":"GitHub Variable KMUTT_TRENDS_SHEET_ID ยังไม่ได้ตั้งค่า — ติดต่อ dev","message_en":"GitHub repository Variable KMUTT_TRENDS_SHEET_ID is not set — contact the developer"}]
+          EOF
+            echo "::error::KMUTT_TRENDS_SHEET_ID is unset. Set it in repo Settings → Variables."
+            exit 1
+          fi
+
+      - name: Write service account credentials
+        env:
+          GCP_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          # Use printf via env-var (NOT echo via ${{ … }}) so single-quotes
+          # or backslashes inside the JSON cannot break the shell or be
+          # interpreted as escape sequences.
+          printf '%s' "$GCP_KEY" > /tmp/gcp-key.json
 
       # SHEET_ID and USER_EMAIL go through `env:` rather than direct
       # `${{ ... }}` interpolation in shell. This prevents script
@@ -1529,7 +1711,7 @@ jobs:
           retention-days: 7
 
       - name: Upload sync-errors artifact
-        if: failure()
+        if: failure() && hashFiles('errors.json') != ''
         uses: actions/upload-artifact@v4
         with:
           name: sync-errors
@@ -1703,8 +1885,12 @@ function pollStatus(correlationId) {
   const props = _props();
   const repo = props.getProperty('REPO');
   const pat = props.getProperty('GITHUB_PAT');
+  // per_page=100 is GitHub's hard cap. We need this many because
+  // `event=repository_dispatch` filter cannot also filter by event_type;
+  // other dispatch types or bursty publishes could push our run off the
+  // first page with the default per_page=30.
   const r = UrlFetchApp.fetch(
-    `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=20`,
+    `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=100`,
     { headers: _ghHeaders(pat), muteHttpExceptions: true }
   );
   if (r.getResponseCode() !== 200) {
@@ -1976,6 +2162,7 @@ Pre-conditions:
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import gspread
@@ -2086,6 +2273,28 @@ def main():
 
     charts = load_charts(Path(args.data_dir))
     print(f"Loaded {len(charts)} charts")
+
+    # Self-check: every KPI_SERIES_KEY mapping must point to a series that
+    # actually exists in that chart's JSON. A typo here would create a
+    # workbook that fails validation from Day 1 with no easy fix path
+    # (STYLE-charts is protected → only dev can correct via re-bootstrap).
+    kpi_problems = []
+    for c in charts:
+        kpi = KPI_SERIES_KEY.get(c["id"])
+        if not kpi:
+            kpi_problems.append(f"missing KPI_SERIES_KEY for chart '{c['id']}'")
+            continue
+        if not any(s["key"] == kpi for s in c["series"]):
+            kpi_problems.append(
+                f"KPI_SERIES_KEY['{c['id']}']='{kpi}' but no series with that "
+                f"key in {c['id']}.json (available: "
+                f"{[s['key'] for s in c['series']]})"
+            )
+    if kpi_problems:
+        print("BUG in KPI_SERIES_KEY mapping (must match web/src/App.tsx):")
+        for p in kpi_problems:
+            print(f"  - {p}")
+        sys.exit(1)
 
     # 1) Reset to a clean slate. Bootstrap is idempotent: re-runs are
     # supported. We:
@@ -2228,15 +2437,28 @@ def _apply_chart_tab_guardrails(sh, charts, chart_gid, allowed_editors):
                 }
             })
 
-        # Year column (A) from row 18 onward
+        # Year column (A) from row 18 onward.
+        # Accept either a plain BE year in [2500, 2700] OR a NNNN-NNNN BE
+        # range with both endpoints in [2500, 2700]. The *-3yr charts and
+        # patents row 1 use range format ("2542-2544" etc), so a naive
+        # NUMBER_BETWEEN rule would reject 6 of the 20 charts on Day 1.
+        year_formula = (
+            '=OR('
+              'AND(ISNUMBER(A18),A18>=2500,A18<=2700),'
+              'AND('
+                'REGEXMATCH(A18&"","^\\d{4}-\\d{4}$"),'
+                'VALUE(LEFT(A18,4))>=2500,VALUE(LEFT(A18,4))<=2700,'
+                'VALUE(RIGHT(A18,4))>=2500,VALUE(RIGHT(A18,4))<=2700'
+              ')'
+            ')'
+        )
         requests.append({
             "setDataValidation": {
                 "range": {"sheetId": gid, "startRowIndex": 17, "startColumnIndex": 0, "endColumnIndex": 1},
                 "rule": {
-                    "condition": {"type": "NUMBER_BETWEEN",
-                                  "values": [{"userEnteredValue": "2500"},
-                                             {"userEnteredValue": "2700"}]},
-                    "inputMessage": "ปี (พ.ศ.) ต้องเป็นตัวเลข 4 หลัก ระหว่าง 2500-2700",
+                    "condition": {"type": "CUSTOM_FORMULA",
+                                  "values": [{"userEnteredValue": year_formula}]},
+                    "inputMessage": "ปีต้องเป็น 4 หลัก (2500-2700) หรือช่วงปี NNNN-NNNN",
                     "strict": True,
                 }
             }

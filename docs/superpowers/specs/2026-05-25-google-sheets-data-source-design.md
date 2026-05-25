@@ -477,10 +477,20 @@ Conditional Formatting:
 
 | Check | Mechanism | Effect on failure |
 |---|---|---|
-| Year column is 4-digit Buddhist year (2500–2700) | Data validation: number range | Reject input + tooltip |
+| Year cell is a 4-digit BE year **OR** a `NNNN-NNNN` BE range, all in [2500, 2700] | Data validation: CUSTOM_FORMULA combining `ISNUMBER`/range check with `REGEXMATCH` for ranges | Reject input + tooltip |
 | Value cells are numeric **or empty** | Data validation: `=OR(ISNUMBER(A1),A1="")` | Reject input |
-| No duplicate years | Conditional format: highlight duplicates | Red cell (warning, not blocked) |
+| No duplicate years | Conditional format: highlight duplicates (excluding blank cells) | Red cell (warning, not blocked) |
 | Required text fields not empty (rows 3, 4, 5, 6, 8, 9, 10, 11 — title TH/EN, subtitle TH/EN, methodology TH/EN, source TH/EN) | Conditional format: ISBLANK | Red cell border |
+
+**Important: year format admits ranges.** 6 of the 20 existing charts
+(`income-expense-3yr`, `research-funding-3yr`, `research-per-staff-3yr`,
+`research-per-academic-3yr`, `publications-3yr`, plus the first row of
+`patents`) use 3-year aggregation buckets formatted as `"NNNN-NNNN"`
+strings (e.g. `"2542-2544"`). The React app already handles this (e.g.
+`KpiCard.tsx` checks `!lastYearTh.includes('-')` for year-label
+formatting). The validator and the Sheets data-validation rule must
+accept both pure 4-digit BE years AND `NNNN-NNNN` ranges where both
+endpoints fall in [2500, 2700].
 
 **Note on intentional `null` values.** 5 of the 20 current charts (patents,
 programs, staff-total, research-funding, research-funding-3yr) contain
@@ -530,10 +540,28 @@ a half-broken state.
    blank) are still skipped silently — this is how trailing empty
    rows in the sheet are tolerated.
 
+3. **Row-shift sanity check.** Sheets cell protection covers the locked
+   rows (1, 13, 14) but a workbook Editor can still **delete entire
+   rows**, which shifts every row below up by one. Without a sanity
+   check, deleting row 15 (Name TH) would cause the parser to read
+   Name EN as Name TH, the year header as Name EN, and the first data
+   row as the year-header row — silently producing garbage. The parser
+   must verify a known sentinel before reading the data table: cell
+   `A17` (0-indexed `rows[16][0]`) must start with the literal text
+   `"Year"`. If not, raise — orchestrator surfaces as a parse_error
+   advising the data collector to undo any deleted rows.
+
 ```python
 # pseudo (operates on ChartData dicts produced by the parser)
 ALLOWED_FLAGS = {"emphasis", "exclude_from_stack", "is_cumulative"}
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+YEAR_RE = re.compile(r"^(\d{4})(?:-(\d{4}))?$")  # plain BE year OR BE range
+YEAR_MIN, YEAR_MAX = 2500, 2700
+
+def year_sort_key(y):
+    """Sort by start-year so ranges and plain years sort together."""
+    m = YEAR_RE.match(y)
+    return int(m.group(1)) if m else -1
 
 errors = []
 for tab_name, data in parsed_charts.items():
@@ -544,15 +572,19 @@ for tab_name, data in parsed_charts.items():
     years = data["categories_buddhist"]
     if len(set(years)) != len(years):
         errors.append(f"{tab_name}: duplicate years")
-    if years != sorted(years):
-        errors.append(f"{tab_name}: years not sorted ascending")
+    if years != sorted(years, key=year_sort_key):
+        errors.append(f"{tab_name}: years not sorted ascending (by start-year)")
     for y in years:
-        try:
-            yi = int(y)
-            if yi < 2500 or yi > 2700:
-                errors.append(f"{tab_name}: year '{y}' outside 2500-2700")
-        except ValueError:
-            errors.append(f"{tab_name}: year '{y}' is not an integer")
+        m = YEAR_RE.match(y)
+        if not m:
+            errors.append(f"{tab_name}: year '{y}' not a 4-digit BE year or NNNN-NNNN range")
+            continue
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if not (YEAR_MIN <= start <= YEAR_MAX and YEAR_MIN <= end <= YEAR_MAX):
+            errors.append(f"{tab_name}: year '{y}' outside {YEAR_MIN}-{YEAR_MAX}")
+        if m.group(2) and start > end:
+            errors.append(f"{tab_name}: year range '{y}' has start > end")
 
     # series_key row, preserved-position
     series_keys = [s["key"] for s in data["series"]]
@@ -594,6 +626,19 @@ for (cid, sk), style in STYLE_SERIES.items():
 for cid in STYLE_CHARTS:
     if cid not in {d["id"] for d in parsed_charts.values()}:
         errors.append(f"missing chart tab for '{cid}' (declared in STYLE-charts)")
+
+# Cross-check: no two chart tabs may carry the same chart_id. Possible
+# vector: data collector duplicates a tab in Sheets ("Copy of
+# EDU-students-all"), renames it to a different prefix; both tabs now
+# parse to ChartData with id="students-all", and write_charts() silently
+# overwrites one with the other — losing edits with no warning.
+seen_ids = {}
+for tab, data in parsed_charts.items():
+    cid = data["id"]
+    if cid in seen_ids:
+        errors.append(f"duplicate chart_id '{cid}': tabs '{seen_ids[cid]}' and '{tab}'")
+    else:
+        seen_ids[cid] = tab
 
 # Cross-check: every (chart_id, series_key) declared in STYLE-series must
 # appear in the corresponding chart tab. Catches the case where the chart
@@ -918,6 +963,57 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
   contradicted the "optional downgrade" model. Now states the sync
   runtime treats the workbook as read-only by design, regardless of
   the SA's actual role.
+
+## Resolved decisions (round 6.5 — internal review)
+
+- **Year cells accept BE ranges (`NNNN-NNNN`), not just plain years.**
+  6 of 20 existing charts use `"NNNN-NNNN"` strings for 3-year aggregate
+  buckets. The earlier round-3 integer-only validator would have rejected
+  every one of them on Day 1 — caught only on fresh-eyes internal review.
+  Layer 1 (Sheets data validation) uses a CUSTOM_FORMULA combining
+  `ISNUMBER`/range with `REGEXMATCH` + endpoint checks. Layer 2 (Python)
+  uses `re.compile(r"^(\d{4})(?:-(\d{4}))?$")` and a `year_sort_key()`
+  that sorts by start-year so ranges and plain years interleave.
+- **Parser sanity check at row 17 (Year header).** Sheets cell-range
+  protection covers row 1, 13, 14 — but a workbook Editor can still
+  delete an entire row. Without a sanity check, deleting row 15 (Name
+  TH) would shift every row up by one and the parser would silently
+  publish garbage. Parser now asserts cell A17 starts with the literal
+  "Year"; mismatch raises ValueError.
+- **Validator catches duplicate chart_id across tabs.** Possible vector:
+  data collector duplicates a chart tab in Sheets and renames the new
+  tab. Both parse to the same chart_id and `write_charts` silently
+  overwrites — no error, no diff hint. New cross-check at validator
+  surfaces both tab names.
+- **Bootstrap KPI self-check.** The hand-authored `KPI_SERIES_KEY`
+  mapping (mirrors React App.tsx) is verified against JSON at bootstrap
+  time — a typo would otherwise yield an unpublishable workbook with
+  no easy fix path (STYLE-charts is protected). `bootstrap_sheets.py`
+  exits 1 with a clear message if any KPI key doesn't match an actual
+  series.
+- **Workflow SHEET_ID preflight.** If the GitHub repository Variable
+  `KMUTT_TRENDS_SHEET_ID` is unset (e.g. after a fork/clone), the
+  workflow now writes a structured `errors.json` and fails with a
+  Thai/English message in the publish modal instead of crashing
+  silently in gspread.
+- **Workflow uses `env:` for `secrets.GOOGLE_SERVICE_ACCOUNT_JSON`.**
+  Was shell-interpolated via `echo`, which could break on legitimate
+  JSON characters (single quotes, backslashes). Now `printf '%s'` from
+  an env var — defense-in-depth even though secrets are admin-scoped.
+- **Apps Script poll `per_page=100`** (was 20). Bursty publishes or
+  any other repository_dispatch event_type could otherwise push our
+  run off the first page; under busy conditions the modal would spin
+  until the 5-minute timeout.
+- **Plan removes bash heredocs in favour of a real script file.** The
+  Phase 0.5 schema-cleanup heredoc broke on Windows PowerShell. Now
+  ships as `scripts/_strip_slide.py` invoked via `python` (works on
+  every shell). Git-commit messages now provide both Bash and
+  PowerShell variants.
+- **`writer.py` writes a trailing newline.** Aligned with the strip
+  script and editor convention; without this, the first sync after
+  schema-cleanup would diff every file purely on EOF-newline mismatch
+  (canonical-JSON comparison would still pass, but `git diff` would
+  not — making the migration noisy).
 
 ## Effort Estimate
 
