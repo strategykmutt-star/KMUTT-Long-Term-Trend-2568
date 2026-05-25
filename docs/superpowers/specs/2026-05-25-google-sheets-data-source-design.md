@@ -19,7 +19,7 @@ filing a ticket with engineering.
 ## Goal
 
 Let the data collector update **numbers, year ranges, and all TH/EN text**
-(title, subtitle, methodology, source, series names) for the existing 21
+(title, subtitle, methodology, source, series names) for the existing 20
 charts, end-to-end, by themselves — using only Google Sheets and a single
 "Publish" button.
 
@@ -44,8 +44,9 @@ charts, end-to-end, by themselves — using only Google Sheets and a single
 │   1 workbook,          │
 │   23 tabs:             │
 │     📋 INDEX           │
-│     🎨 STYLE           │
-│     21 chart tabs      │
+│     🎨 STYLE-charts    │
+│     🎨 STYLE-series    │
+│     20 chart tabs      │
 │                        │
 │   Custom menu:         │
 │     "📤 Publish to     │
@@ -88,7 +89,7 @@ charts, end-to-end, by themselves — using only Google Sheets and a single
 | Apps Script (`apps_script/Code.gs`) | Publish/dry-run menu, status modals, error reporting |
 | `.github/workflows/sync-from-sheets.yml` | Reacts to repository_dispatch from Apps Script |
 | `scripts/sync_from_sheets.py` | Reads Sheets → validates → writes JSON |
-| `scripts/bootstrap_sheets.py` | One-time: 21 JSON files → Sheets |
+| `scripts/bootstrap_sheets.py` | One-time: 20 JSON files → Sheets |
 | `scripts/lib/{sheets_client,parsers,validators}.py` | Shared helpers |
 | `docs/data-collector-guide-th.md` | Thai-language manual for the data collector |
 | GitHub Secret `GOOGLE_SERVICE_ACCOUNT_JSON` | GitHub Action → Sheets API auth |
@@ -96,23 +97,51 @@ charts, end-to-end, by themselves — using only Google Sheets and a single
 
 ## Sheet Schema
 
+### Canonical chart list (20 charts)
+
+This is the authoritative mapping that drives both the bootstrap script and
+validation. Tab prefixes group charts visually; tab background colour mirrors
+the section.
+
+| chart_id | section | chart_type | tab name |
+|---|---|---|---|
+| programs | education | stacked-bar | `EDU-programs` |
+| students-new | education | line | `EDU-students-new` |
+| students-all | education | line | `EDU-students-all` |
+| graduates | education | line | `EDU-graduates` |
+| employment-bachelor | education | stacked-bar | `EDU-employment-bachelor` |
+| employment-graduate | education | stacked-bar | `EDU-employment-graduate` |
+| staff-total | personnel | stacked-bar | `PER-staff-total` |
+| faculty-degree | personnel | stacked-bar | `PER-faculty-degree` |
+| staff-academic-support | personnel | stacked-bar | `PER-staff-academic-support` |
+| research-funding | research | stacked-bar | `RES-research-funding` |
+| research-funding-3yr | research | stacked-bar | `RES-research-funding-3yr` |
+| research-per-staff | research | line | `RES-research-per-staff` |
+| research-per-staff-3yr | research | line | `RES-research-per-staff-3yr` |
+| research-per-academic-3yr | research | line | `RES-research-per-academic-3yr` |
+| publications | research | stacked-bar | `RES-publications` |
+| publications-3yr | research | stacked-bar | `RES-publications-3yr` |
+| publications-per-academic | research | clustered-bar | `RES-publications-per-academic` |
+| patents | research | clustered-bar | `RES-patents` |
+| income-expense | finance | line | `FIN-income-expense` |
+| income-expense-3yr | finance | line | `FIN-income-expense-3yr` |
+
+Prefix → section: `EDU-` → education, `PER-` → personnel, `RES-` → research,
+`FIN-` → finance.
+
 ### Workbook layout
 
 23 tabs in one Google Sheets workbook:
 
 ```
 📋 INDEX            (auto-generated navigation, read-only)
-🎨 STYLE            (chart_type, section, colour, flags — locked to data collector)
-EDU-students-all    (1 tab per chart, prefix = section)
+🎨 STYLE-charts     (per-chart config: section, chart_type — locked)
+🎨 STYLE-series     (per-series config: color, flags — locked)
+EDU-programs        (20 chart tabs — see canonical list above)
 EDU-students-new
-EDU-graduates
-... (18 more chart tabs)
-RES-patents
-FIN-income-expense
+... (18 more)
+FIN-income-expense-3yr
 ```
-
-Tab prefixes group charts visually (`EDU-` / `PER-` / `RES-` / `FIN-`).
-Tab background colour mirrors the section.
 
 ### Per-chart tab schema
 
@@ -149,20 +178,69 @@ Tab background colour mirrors the section.
 - Freeze panes at row 17 so the header stays visible while scrolling years.
 - Adding a year = new row at the bottom. Removing a year = delete row.
 
-### STYLE tab schema (dev-only)
+### STYLE-charts tab schema (dev-only)
 
-| chart_id | chart_type | section | series_key | color | flags |
-|---|---|---|---|---|---|
-| students-all | line | education | bachelor | #f29400 | |
-| students-all | line | education | graduate | #1e6091 | |
-| students-all | line | education | total | #0f172a | emphasis |
-| ... | ... | ... | ... | ... | ... |
+| chart_id | section | chart_type |
+|---|---|---|
+| students-all | education | line |
+| students-new | education | line |
+| ... | ... | ... |
+
+- One row per chart, exactly 20 rows.
+- This tab is the authoritative source for `section` and `chart_type`.
+- Entire tab is cell-protected; only developers can edit.
+
+### STYLE-series tab schema (dev-only)
+
+| chart_id | series_key | color | flags |
+|---|---|---|---|
+| students-all | bachelor | #f29400 | |
+| students-all | graduate | #1e6091 | |
+| students-all | total | #0f172a | emphasis |
+| students-new | bachelor | #f29400 | |
+| ... | ... | ... | ... |
 
 - One row per (chart × series).
-- Entire tab is protected; only developers (with edit permission on the
-  sheet) can change it.
-- `flags` column accepts a comma-separated subset of `emphasis`,
-  `exclude_from_stack`, `is_cumulative`.
+- `color` is a 7-character hex code (`#RRGGBB`).
+- `flags` accepts a comma-separated subset of `emphasis`,
+  `exclude_from_stack`, `is_cumulative`. Empty cell = no flags.
+- Entire tab is cell-protected; only developers can edit.
+
+### JSON output schema (consumer contract)
+
+The sync script produces per-chart files at `web/src/data/<chart_id>.json`
+matching the existing schema **with one change**: the `slide` field (a
+legacy reference to PPTX slide numbers, present in every current JSON file
+but **unused by the React app**) is dropped. The implementation plan must
+also remove `slide: number` from `web/src/types.ts`.
+
+Internal Python key names used by the parser, validator, and JSON writer
+(must agree across all three):
+
+```python
+ChartData = {
+    "id": str,                   # from chart tab cell B1
+    "section": str,              # from STYLE-charts
+    "chart_type": str,           # from STYLE-charts
+    "title": {"th": str, "en": str},       # rows 3-4
+    "subtitle": {"th": str, "en": str},    # rows 5-6
+    "categories_buddhist": [str, ...],     # column A, rows 18+
+    "series": [
+        {
+            "key": str,                    # row 14
+            "name": {"th": str, "en": str},  # rows 15-16
+            "color": str,                  # from STYLE-series
+            "values": [float | None, ...], # rows 18+ for that series column
+            "emphasis": bool,              # only present if flag set
+            "exclude_from_stack": bool,    # only present if flag set
+            "is_cumulative": bool,         # only present if flag set
+        },
+        ...
+    ],
+    "methodology": {"th": str, "en": str}, # rows 8-9
+    "source": {"th": str, "en": str},      # rows 10-11
+}
+```
 
 ### INDEX tab schema (auto-generated, read-only)
 
@@ -225,34 +303,79 @@ Failure (validation or workflow error):
 ### What happens behind the scenes
 
 1. **Apps Script** (in Sheets)
-   - Reads Sheet ID + current user's email.
-   - POST `/repos/<org>/<repo>/dispatches` to GitHub API with header
-     `Authorization: Bearer <GITHUB_PAT>` and body
-     `{ event_type: "sync-sheets", client_payload: { sheet_id, user_email, dry_run: bool } }`.
-   - Polls workflow status every 5 seconds and updates the modal.
+   - Reads `SHEET_ID` and `GITHUB_PAT` from Script Properties (set once at
+     install; not hard-coded so the same script works across forks).
+   - Reads `repo` (e.g. `kmutt-strategy/trends-dashboard`) from a third
+     Script Property.
+   - Generates a 16-character hex `correlation_id` (UUID-derived).
+   - POST `/repos/{repo}/dispatches` with body:
+     ```json
+     {
+       "event_type": "sync-sheets",
+       "client_payload": {
+         "sheet_id": "...",
+         "user_email": "...",
+         "dry_run": false,
+         "correlation_id": "abc123…"
+       }
+     }
+     ```
+   - Polls `/repos/{repo}/actions/runs?event=repository_dispatch&per_page=20`
+     every 5 seconds, filtering for a run whose `name` field contains the
+     `correlation_id` (set by the workflow's `run-name`).
+   - When the matched run reaches `status=completed`:
+     - On `conclusion=success` → download the `sync-result` artifact (a
+       single JSON file) and render the appropriate modal (publish success
+       summary, or dry-run diff).
+     - On `conclusion=failure` → download the `sync-errors` artifact (JSON
+       list of validation errors) and render the error modal.
+   - Times out after 5 minutes; modal shows a "View run on GitHub" link as
+     fallback.
 
 2. **GitHub Action `sync-from-sheets.yml`**
    - Trigger: `repository_dispatch` with `event_type == sync-sheets`.
-   - Steps: checkout → setup Python → `pip install gspread google-auth` →
-     write `GOOGLE_SERVICE_ACCOUNT_JSON` secret to a temp file →
-     `python scripts/sync_from_sheets.py --sheet-id $SHEET_ID [--dry-run]`.
-   - If non-dry-run and the script wrote changes:
-     `git add web/src/data/*.json`,
-     `git commit -m "Sync from Sheets by $USER_EMAIL at $TIMESTAMP"`,
-     `git push`.
+   - Top-level `run-name: "Sync from Sheets [${{ github.event.client_payload.correlation_id }}]"`
+     so Apps Script can locate the run.
+   - Steps:
+     1. checkout → setup Python → `pip install gspread google-auth`
+     2. Write `GOOGLE_SERVICE_ACCOUNT_JSON` secret to a temp file
+     3. `python scripts/sync_from_sheets.py --sheet-id "$SHEET_ID" [--dry-run] --result-out result.json --errors-out errors.json`
+     4. If exit code 0: upload `result.json` as artifact `sync-result`. On
+        non-dry-run runs with `result.changed_files` non-empty:
+        `git add web/src/data/*.json`,
+        `git commit -m "Sync from Sheets by $USER_EMAIL at $TIMESTAMP"`,
+        `git push`. **Idempotency:** if `changed_files` is empty, skip the
+        commit entirely (no empty commit on no-op publishes).
+     5. If exit code 1: upload `errors.json` as artifact `sync-errors` and
+        fail the workflow (exit 1) so Apps Script sees the failure
+        conclusion.
    - The existing `deploy.yml` picks up the push and deploys.
 
 3. **`scripts/sync_from_sheets.py`**
-   - Auth via service account JSON → open the Sheet by ID.
-   - Read STYLE tab → build `{chart_id: {series_key: {color, flags, chart_type, section}}}` map.
-   - Iterate non-admin tabs (those not starting with `📋` or `🎨` or `_`):
-     - Parse metadata (rows 1–11).
-     - Parse series header (rows 14–16) and join with STYLE config.
+   - CLI: `--sheet-id`, `--dry-run` (no writes), `--result-out PATH`,
+     `--errors-out PATH`.
+   - Auth via `GOOGLE_APPLICATION_CREDENTIALS` env (path to service account
+     JSON) → open the Sheet by ID.
+   - Read STYLE-charts → `{chart_id: {section, chart_type}}`.
+   - Read STYLE-series → `{(chart_id, series_key): {color, flags}}`.
+   - Iterate tabs whose names match the canonical prefix list
+     (`EDU-` / `PER-` / `RES-` / `FIN-`); ignore everything else.
+   - For each chart tab:
+     - Parse metadata (rows 1–11) into `ChartData` (see JSON Schema above).
+     - Parse series header (rows 14–16) and join with STYLE-series.
      - Parse data table (rows 18+).
-     - Run validation (see below).
-   - If validation passes: write each chart's JSON to `web/src/data/<chart_id>.json` and update INDEX tab.
-   - If dry-run: print a unified diff to stdout (consumed by Apps Script) and exit 0 without writing.
-   - If validation fails: print errors as structured Markdown and exit 1.
+     - Validate (see Validation section).
+   - If any validation errors: write structured error list to
+     `errors.json` and exit 1.
+   - If validation passes:
+     - Compare each candidate JSON against existing
+       `web/src/data/<chart_id>.json` (canonical sorted/indented JSON
+       comparison to avoid spurious diffs).
+     - In `--dry-run` mode: write the diff summary to `result.json` and
+       exit 0 (no file writes).
+     - Otherwise: write changed JSON files, refresh the INDEX tab via
+       Sheets API, write a `result.json` summarising
+       `changed_files: [...]` and `change_summaries: [...]`, exit 0.
 
 4. **`deploy.yml` (existing)** — unchanged.
 
@@ -280,25 +403,34 @@ if any chart fails, no JSON is written for any chart. The dashboard never sees
 a half-broken state.
 
 ```python
-# pseudo
+# pseudo (operates on ChartData dicts produced by the parser)
 errors = []
-for tab in chart_tabs:
-    data = parse_tab(tab)
-    if data.chart_id not in STYLE_CONFIG:
-        errors.append(f"{tab}: chart_id '{data.chart_id}' missing from STYLE")
-    years = data.years
-    if len(set(years)) != len(years): errors.append(f"{tab}: duplicate years")
-    if years != sorted(years): errors.append(f"{tab}: years not sorted")
-    for sk in data.series_keys:
-        if sk not in STYLE_CONFIG.get(data.chart_id, {}):
-            errors.append(f"{tab}: series '{sk}' not in STYLE")
-        if len(data.values[sk]) != len(years):
-            errors.append(f"{tab}: series '{sk}' value count != year count")
-    for f in ["title_th", "title_en", "methodology_th", "methodology_en", "source_th", "source_en"]:
-        if not data.metadata[f].strip():
-            errors.append(f"{tab}: missing {f}")
+for tab_name, data in parsed_charts.items():
+    cid = data["id"]
+    if cid not in STYLE_CHARTS:
+        errors.append(f"{tab_name}: chart_id '{cid}' missing from STYLE-charts")
+    years = data["categories_buddhist"]
+    if len(set(years)) != len(years):
+        errors.append(f"{tab_name}: duplicate years")
+    if years != sorted(years):
+        errors.append(f"{tab_name}: years not sorted ascending")
+    for s in data["series"]:
+        if (cid, s["key"]) not in STYLE_SERIES:
+            errors.append(f"{tab_name}: series '{s['key']}' missing from STYLE-series")
+        if len(s["values"]) != len(years):
+            errors.append(f"{tab_name}/{s['key']}: value count != year count")
+    for path in [("title", "th"), ("title", "en"),
+                 ("subtitle", "th"), ("subtitle", "en"),
+                 ("methodology", "th"), ("methodology", "en"),
+                 ("source", "th"), ("source", "en")]:
+        if not data[path[0]][path[1]].strip():
+            errors.append(f"{tab_name}: missing {'.'.join(path)}")
+# Cross-check: every chart_id in STYLE-charts must have a matching tab
+for cid in STYLE_CHARTS:
+    if cid not in {d["id"] for d in parsed_charts.values()}:
+        errors.append(f"missing chart tab for '{cid}' (declared in STYLE-charts)")
 if errors:
-    print_errors_as_markdown(errors)
+    write_errors_json(errors, args.errors_out)
     sys.exit(1)
 ```
 
@@ -337,8 +469,8 @@ One-time, run by the developer:
 | Step | Time | Action |
 |---|---|---|
 | 1 | 5 min | Create empty Google Sheets named "KMUTT Trends — Data Source". Note Sheet ID. Create GCP project + service account, download JSON key, share Sheet with service account email. Generate fine-grained GitHub PAT. |
-| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path>` — script reads `web/src/data/*.json`, creates STYLE + 21 chart tabs with full schema (data validation, conditional formatting, cell protection, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
-| 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` → set Script Property `GITHUB_PAT`. Reload Sheet; verify `📤 Publish` menu appears. |
+| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting, cell protection, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
+| 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` → set Script Properties `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`). Reload Sheet; verify `📤 Publish` menu appears. |
 | 4 | 5 min | In GitHub repo: add Secret `GOOGLE_SERVICE_ACCOUNT_JSON`, commit `.github/workflows/sync-from-sheets.yml` and `scripts/sync_from_sheets.py`. |
 | 5 | 5 min | Sanity check: click "Check what will change (dry-run)" — should report no diff (data matches JSON). Edit one cell, dry-run again — should show diff. Click "Publish all changes" — verify commit + deploy + live dashboard update. |
 
@@ -351,19 +483,41 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
    touched. Cost: an extra column update on every sync. Decide during
    implementation.
 2. **Apps Script poll interval.** 5 seconds keeps the modal feeling alive but
-   uses ~24 GitHub API calls per publish. If we hit secondary rate limits,
+   uses ~12 GitHub API calls per publish. If we hit secondary rate limits,
    back off to 10 s.
 3. **Where to host the data-collector guide.** Markdown in `docs/` is
-   discoverable for devs but harder for the data collector to find. Options:
-   embed a "Help" menu item in the Apps Script that opens the guide URL; or
-   publish to a static page under the dashboard itself. Decide before
-   handoff.
+   discoverable for devs but harder for the data collector to find. The
+   Apps Script will include a "📖 Help" menu item that opens the guide's
+   URL — the actual hosting (GitHub raw, Notion, or a `/help` route under
+   the dashboard) is deferred to handoff.
 4. **Should `build_chart_json.py` be deleted or retained?** Retained for now
-   (deprecated comment in header). Delete after one successful cycle of the
-   new flow.
-5. **Multi-language error messages.** All error UI is currently in Thai for
-   the data collector. Validator log output in GitHub Actions stays English
-   for the developer. Confirm this split is fine.
+   (deprecated comment added in header). Delete after one successful cycle
+   of the new flow in production.
+5. **Multi-language error messages.** Error UI in Sheets modals is in Thai
+   for the data collector. Validator log output in GitHub Actions stays
+   English for the developer. The Python script's `errors.json` carries
+   both: `{ "th": "...", "en": "..." }` per error. Confirm during
+   implementation.
+
+## Resolved decisions (from spec review)
+
+- **Chart count is 20**, not 21 (one-time error in initial draft, corrected
+  throughout).
+- **`slide` field is dropped** from the JSON schema. It is a legacy PPTX
+  artefact unused by the React app (confirmed: no reference in
+  `web/src/{App,Chart,ChartCard,KpiCard}.tsx`). Implementation plan must
+  also remove `slide: number` from `web/src/types.ts`.
+- **STYLE tab is split** into STYLE-charts (per chart) and STYLE-series (per
+  chart × series) to eliminate the duplicate-section problem flagged in
+  review.
+- **Run identification** uses a `correlation_id` injected into the
+  workflow's `run-name`, so Apps Script can locate its dispatched run even
+  under concurrent triggers.
+- **Dry-run results and validation errors** are returned to Apps Script via
+  GitHub workflow artifacts (`sync-result`, `sync-errors`) — not stdout,
+  not commit comments.
+- **Idempotency:** the workflow skips the commit if no JSON files changed,
+  so repeated "Publish" clicks with no edits do not produce empty commits.
 
 ## Effort Estimate
 
