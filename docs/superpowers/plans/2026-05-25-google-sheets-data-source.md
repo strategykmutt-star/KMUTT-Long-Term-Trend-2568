@@ -1284,8 +1284,7 @@ function _showResult(result, dryRun, repo) {
     return;
   }
   if (result.conclusion === 'success') {
-    const artifactName = dryRun ? 'sync-result' : 'sync-result';
-    const data = _downloadArtifactJson(repo, result.runId, artifactName, 'result.json');
+    const data = _downloadArtifactJson(repo, result.runId, 'sync-result', 'result.json');
     const title = dryRun ? '🔍 ผลการตรวจสอบ (ยังไม่ publish)' : '✅ Publish สำเร็จ';
     const body = _renderResultBody(data, dryRun);
     const html = HtmlService.createHtmlOutput(body).setWidth(520).setHeight(400);
