@@ -414,8 +414,9 @@ def test_parse_chart_tab_returns_expected_chartdata():
 
 def test_parse_chart_tab_treats_empty_value_cells_as_none():
     rows = load("students-all-rows.json")
-    # Mutate fixture: blank the bachelor 2566 cell
-    rows[20][1] = ""
+    # Fixture data rows (0-indexed): 17=2564, 18=2565, 19=2566, 20=2567, 21=2568
+    # Blank the bachelor 2566 cell → values index 2.
+    rows[19][1] = ""
     style_charts = parse_style_charts(load("style-charts-rows.json"))
     style_series = parse_style_series(load("style-series-rows.json"))
 
@@ -991,7 +992,7 @@ def run_sync(client, out_dir: Path, dry_run: bool) -> dict:
     errors = parse_errors + validate(parsed, style_charts, style_series)
     if errors:
         return {"status": "validation_failed", "errors": errors,
-                "changed_files": [], "change_summaries": []}
+                "changed_files": []}
 
     charts = list(parsed.values())
     if dry_run:
@@ -1007,13 +1008,11 @@ def run_sync(client, out_dir: Path, dry_run: bool) -> dict:
                 if not json_equal(existing, c):
                     changed.append(f"{c['id']}.json")
         return {"status": "success", "dry_run": True,
-                "errors": [], "changed_files": sorted(changed),
-                "change_summaries": [f"would update {f}" for f in sorted(changed)]}
+                "errors": [], "changed_files": sorted(changed)}
 
     changed = write_charts(charts, out_dir)
     return {"status": "success", "dry_run": False,
-            "errors": [], "changed_files": changed,
-            "change_summaries": [f"updated {f}" for f in changed]}
+            "errors": [], "changed_files": changed}
 
 
 def main():
@@ -1104,16 +1103,24 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > /tmp/gcp-key.json
 
-      - name: Run sync script
-        env:
-          DRY_RUN_FLAG: ${{ github.event.client_payload.dry_run && '--dry-run' || '' }}
+      - name: Run sync script (publish)
+        if: github.event.client_payload.dry_run != true
+        run: |
+          python scripts/sync_from_sheets.py \
+            --sheet-id "${{ github.event.client_payload.sheet_id }}" \
+            --credentials /tmp/gcp-key.json \
+            --result-out result.json \
+            --errors-out errors.json
+
+      - name: Run sync script (dry-run)
+        if: github.event.client_payload.dry_run == true
         run: |
           python scripts/sync_from_sheets.py \
             --sheet-id "${{ github.event.client_payload.sheet_id }}" \
             --credentials /tmp/gcp-key.json \
             --result-out result.json \
             --errors-out errors.json \
-            $DRY_RUN_FLAG
+            --dry-run
 
       - name: Upload sync-result artifact
         if: success()
@@ -1180,7 +1187,8 @@ Apps Script has limited automated-testing infrastructure; this task relies on ca
 //
 const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
-const HELP_URL = 'https://github.com/REPLACE/dashboard/blob/main/docs/data-collector-guide-th.md';
+// TODO(setup): replace <org>/<repo> with the actual GitHub repo path during initial setup
+const HELP_URL = 'https://github.com/<org>/<repo>/blob/main/docs/data-collector-guide-th.md';
 
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
@@ -1426,7 +1434,11 @@ to:
 cd web
 npm run build
 ```
-Expected: build succeeds. (The `slide` property still present in all 20 JSON files is ignored at runtime since JSON imports aren't type-checked structurally for extra keys.)
+Expected: build succeeds. The `slide` property still present in all 20 JSON
+files is harmless: Vite passes JSON through unchanged at runtime, and the
+existing imports don't trigger TypeScript's excess-property checks. Those
+stale `slide` keys are cleaned automatically the first time
+`sync_from_sheets.py` writes the JSON (Phase 6 / Phase 8).
 
 - [ ] **Step 4: Commit**
 
@@ -1563,39 +1575,40 @@ def main():
     ws = sh.add_worksheet(title="🎨 STYLE-series", rows=max(50, len(rows) + 5), cols=5)
     ws.update("A1", rows, value_input_option="RAW")
 
-    # 4) Create one tab per chart
+    # 4) Create one tab per chart, capturing each tab's gid so the INDEX
+    #    HYPERLINKs can target the right tab.
+    chart_gid: dict[str, int] = {}
     for c in charts:
         values = build_chart_tab_values(c)
         ws = sh.add_worksheet(title=tab_name(c), rows=max(60, len(values) + 10),
                               cols=1 + len(c["series"]) + 1)
         ws.update("A1", values, value_input_option="RAW")
-        # Tab colour by section
         ws.update_tab_color(SECTION_COLOR[c["section"]])
-        # Freeze rows above year-1
         ws.freeze(rows=17)
+        chart_gid[c["id"]] = ws.id  # gspread Worksheet.id == Sheets gid
 
-    # 5) Create INDEX tab
+    # 5) Create INDEX tab with HYPERLINKs that target each tab's real gid.
     index_rows = [["Chart ID", "Section", "Title TH", "Title EN", "# years", "# series", "Jump"]]
     for c in charts:
+        gid = chart_gid[c["id"]]
         index_rows.append([
             c["id"], c["section"], c["title"]["th"], c["title"]["en"],
             len(c["categories_buddhist"]), len(c["series"]),
-            f'=HYPERLINK("#gid=0","→ {tab_name(c)}")',  # gid filled later
+            f'=HYPERLINK("#gid={gid}","→ {tab_name(c)}")',
         ])
     ws = sh.add_worksheet(title="📋 INDEX", rows=30, cols=8)
     ws.update("A1", index_rows, value_input_option="USER_ENTERED")
     # Move INDEX to first position
     sh.reorder_worksheets([ws] + [w for w in sh.worksheets() if w.id != ws.id])
 
-    # 6) Delete default Sheet1
+    # 6) Delete default Sheet1 (safe — 23 other tabs exist by now)
     sh.del_worksheet(default_ws)
 
-    print(f"Bootstrap complete: {len(charts) + 2} tabs created.")
+    print(f"Bootstrap complete: {len(charts) + 3} tabs created (INDEX + 2 STYLE + {len(charts)} charts).")
     print("Manual follow-ups (not scripted to keep this tool minimal):")
-    print("  - Apply cell protection on locked ranges (rows 1, 14 of each tab; STYLE tabs).")
+    print("  - Apply cell protection on locked ranges (rows 1, 13, 14 of each chart tab; STYLE tabs).")
     print("  - Set data validation on year column (number 2500-2700).")
     print("  - Add conditional formatting for duplicate years.")
-    print("  - Update INDEX HYPERLINK formulas with each tab's gid.")
 
 
 if __name__ == "__main__":
@@ -1693,9 +1706,13 @@ git commit -m "docs: Thai guide for data collector"
 
 Cover: data-flow diagram, key files (link to spec), deploy chain, debugging tips, credential rotation, where to look when things break.
 
-- [ ] **Step 2: Update README.md — replace "Updating data from a new PPT" section**
+- [ ] **Step 2: Update README.md — replace the "Updating data from a new PPT" section**
 
-Replace lines 35–46 of `README.md` with a new section titled "Updating data" that describes the Sheets flow at a high level, links to the data-collector guide for non-devs, and the architecture doc for devs.
+Find the heading `## Updating data from a new PPT` in `README.md` and
+replace that entire section (down to the next `##` heading) with a new
+section titled `## Updating data` that describes the Sheets flow at a high
+level, links to the data-collector guide for non-devs, and the architecture
+doc for devs.
 
 - [ ] **Step 3: Add deprecation header to build_chart_json.py**
 
