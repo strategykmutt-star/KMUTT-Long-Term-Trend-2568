@@ -965,6 +965,15 @@ def test_kpi_series_key_not_in_chart_flagged():
     errors = validate({"EDU-students-all": GOOD_CHART}, style_charts, style_series)
     assert any("kpi_series_key 'phantom'" in e["message_en"] for e in errors)
 
+def test_blank_kpi_series_key_flagged():
+    """Blank STYLE-charts.kpi_series_key must be rejected explicitly —
+    falling back to series[0] in KpiCard would silently publish the
+    wrong KPI without any signal at validation time."""
+    style_charts = {"students-all": {"section": "education", "chart_type": "line",
+                                      "kpi_series_key": ""}}
+    errors = validate({"EDU-students-all": GOOD_CHART}, style_charts, STYLE_SERIES)
+    assert any("must declare kpi_series_key" in e["message_en"] for e in errors)
+
 def test_year_range_string_accepted():
     """The *-3yr charts use NNNN-NNNN year ranges. These must validate."""
     chart = {**GOOD_CHART,
@@ -1176,16 +1185,24 @@ def validate(
 
     # The kpi_series_key declared in STYLE-charts must exist in the
     # chart's actual series list. Without this, KpiCard's fallback to
-    # data.series[0] silently shows the wrong KPI.
+    # data.series[0] silently shows the wrong KPI. A BLANK kpi_series_key
+    # is itself a contract violation — STYLE-charts is documented as the
+    # authoritative source for which series the KpiCard highlights, so
+    # we reject blanks explicitly rather than silently letting KpiCard
+    # fall back to series[0].
     for tab, data in parsed_charts.items():
         cid = data["id"]
         kpi_key = style_charts.get(cid, {}).get("kpi_series_key", "").strip()
-        if kpi_key:
-            actual_keys = {s["key"] for s in data["series"] if s["key"].strip()}
-            if kpi_key not in actual_keys:
-                errors.append(_err(tab, "kpi_series_key",
-                    f"kpi_series_key '{kpi_key}' (STYLE-charts) ไม่พบใน series",
-                    f"kpi_series_key '{kpi_key}' (STYLE-charts) not found in chart series"))
+        if not kpi_key:
+            errors.append(_err(tab, "kpi_series_key",
+                "STYLE-charts ต้องระบุ kpi_series_key (กำหนดว่า KPI card แสดง series ใด)",
+                "STYLE-charts must declare kpi_series_key (drives which series the KPI card shows)"))
+            continue
+        actual_keys = {s["key"] for s in data["series"] if s["key"].strip()}
+        if kpi_key not in actual_keys:
+            errors.append(_err(tab, "kpi_series_key",
+                f"kpi_series_key '{kpi_key}' (STYLE-charts) ไม่พบใน series",
+                f"kpi_series_key '{kpi_key}' (STYLE-charts) not found in chart series"))
 
     return errors
 ```
@@ -2301,16 +2318,18 @@ def main():
     #   a) Drop all existing protected ranges and conditional format rules
     #      (otherwise leftover protections from a prior run will block
     #      subsequent writes, even from the service account).
-    #   b) Drop any leftover placeholder from a previous bootstrap that
-    #      failed midway (matches the prefix, not just an exact name).
-    #   c) Create a NEW placeholder with a unique timestamp suffix so
-    #      partial-failure re-runs never collide.
-    #   d) Delete every tab except the new placeholder.
-    #   e) At the end of the script, delete the placeholder.
+    #   b) Create a NEW placeholder with a unique timestamp suffix FIRST,
+    #      BEFORE deleting anything else. The Sheets API rejects deleting
+    #      the workbook's last remaining sheet — if a previous bootstrap
+    #      failed in the middle of step (d) below and the only surviving
+    #      tab is a leftover `_bootstrap_placeholder_*`, deleting it before
+    #      adding a replacement would hit that constraint and make rerun
+    #      recovery impossible. Adding first guarantees at least 2 sheets
+    #      exist before any delete fires.
+    #   c) Delete every tab except the new placeholder (this also sweeps
+    #      any leftover `_bootstrap_placeholder_*` tabs from prior runs).
+    #   d) At the end of the script, delete the placeholder.
     _reset_workbook_state(sh)
-    for ws in list(sh.worksheets()):
-        if ws.title.startswith("_bootstrap_placeholder"):
-            sh.del_worksheet(ws)
     import time
     placeholder_name = f"_bootstrap_placeholder_{int(time.time())}"
     placeholder = sh.add_worksheet(title=placeholder_name, rows=1, cols=1)
@@ -2442,13 +2461,23 @@ def _apply_chart_tab_guardrails(sh, charts, chart_gid, allowed_editors):
         # range with both endpoints in [2500, 2700]. The *-3yr charts and
         # patents row 1 use range format ("2542-2544" etc), so a naive
         # NUMBER_BETWEEN rule would reject 6 of the 20 charts on Day 1.
+        #
+        # Tightening (round 7):
+        # - Scalar branch adds `A18=INT(A18)` so fractional values like
+        #   `2500.5` are rejected at entry time (Layer 2 catches them too
+        #   via re.match(r"\d{4}"), but Layer 1 is supposed to be the
+        #   entry-time gate).
+        # - Range branch adds a start<=end ordering check so reversed
+        #   ranges like `2568-2566` cannot be saved (Layer 2 also rejects,
+        #   but Sheets data validation is the first line of defence).
         year_formula = (
             '=OR('
-              'AND(ISNUMBER(A18),A18>=2500,A18<=2700),'
+              'AND(ISNUMBER(A18),A18=INT(A18),A18>=2500,A18<=2700),'
               'AND('
                 'REGEXMATCH(A18&"","^\\d{4}-\\d{4}$"),'
                 'VALUE(LEFT(A18,4))>=2500,VALUE(LEFT(A18,4))<=2700,'
-                'VALUE(RIGHT(A18,4))>=2500,VALUE(RIGHT(A18,4))<=2700'
+                'VALUE(RIGHT(A18,4))>=2500,VALUE(RIGHT(A18,4))<=2700,'
+                'VALUE(LEFT(A18,4))<=VALUE(RIGHT(A18,4))'
               ')'
             ')'
         )

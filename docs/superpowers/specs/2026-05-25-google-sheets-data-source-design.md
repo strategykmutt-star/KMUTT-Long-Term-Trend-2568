@@ -373,7 +373,10 @@ Failure (validation or workflow error):
      every 5 seconds. This avoids hitting the Apps Script 6-minute
      execution-time cap, and the user sees live progress.
    - Per-poll, the server calls
-     `GET /repos/{repo}/actions/runs?event=repository_dispatch&per_page=20`,
+     `GET /repos/{repo}/actions/runs?event=repository_dispatch&per_page=100`
+     (100 is GitHub's hard cap — needed because the `event` filter cannot
+     also filter by `event_type`, so other dispatches or bursty publishes
+     could push our run off page 1 with the default page size),
      and filters by **`display_title`** (NOT `name` — see note below).
      The workflow run's `display_title` is the field that reflects the
      workflow's `run-name:` value; `name` is the workflow's static
@@ -773,7 +776,7 @@ because every JSON file still carries the legacy `slide` key.
 |---|---|---|
 | **0** | **5 min** | **Schema-cleanup commit on `main`:** strip the `slide` key from all 20 `web/src/data/*.json` files (e.g. `jq 'del(.slide)' file.json` or a small Python one-liner). Update `web/src/types.ts` to drop `slide: number` and change `subtitle: Bilingual | null` to `subtitle: Bilingual`. Update `web/src/components/ChartCard.tsx` to remove the now-unnecessary `{data.subtitle && ...}` null check. Run `npm run build` to confirm. Commit and push. This is a no-op for end-users; it just makes the post-bootstrap JSON byte-identical to the pre-bootstrap JSON, so subsequent dry-runs report 0 changes (proving the round-trip works). |
 | 1 | 5 min | Create empty Google Sheets named "KMUTT Trends — Data Source". Note Sheet ID. Create GCP project + service account, download JSON key, share Sheet with service account email — **Editor role** (bootstrap needs write). Also share with the data collector (Editor) and any other dev maintainers (Editor). Generate fine-grained GitHub PAT (Contents: write, Actions: read). |
-| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path> --dev-email <dev's google account>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting for required text fields and duplicate years, **hard-protected ranges with `editors=[dev-email]`**, freeze panes, tab colours), and creates INDEX with HYPERLINKs. |
+| 2 | 10 min | `python scripts/bootstrap_sheets.py --sheet-id <id> --credentials <path> --dev-email <dev's google account>` — script reads `web/src/data/*.json`, creates STYLE-charts + STYLE-series + 20 chart tabs with full schema (data validation, conditional formatting for required text fields and duplicate years, **hard-protected ranges with `editors=[dev-email, service-account-email]`** — SA must be on the editors list so future re-runs can delete protections, see round 5.1 fix), freeze panes, tab colours, and creates INDEX with HYPERLINKs. |
 | 2b | 1 min | (Optional hardening) In the Sheets share dialog, **downgrade the service account from Editor to Viewer**. After this, future bootstrap re-runs require restoring Editor temporarily. |
 | 3 | 5 min | Open Sheet → Extensions → Apps Script → paste `apps_script/Code.gs` AND `apps_script/PublishModal.html` → set Script Properties `GITHUB_PAT`, `SHEET_ID`, `REPO` (e.g. `org/repo`), `HELP_URL`. Reload Sheet; verify `📤 Publish` menu appears. |
 | 4 | 5 min | In GitHub repo: add Secret `GOOGLE_SERVICE_ACCOUNT_JSON`, add Variable `KMUTT_TRENDS_SHEET_ID` (the same Sheet ID from step 1), commit `.github/workflows/sync-from-sheets.yml` and `scripts/sync_from_sheets.py`. |
@@ -892,7 +895,12 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
 - **Protected ranges use editors-allowlist, not warningOnly.** With the
   data collector as a workbook Editor, warning-only protections still
   let them edit after clicking through the warning. Hard protection with
-  `editors=[dev-email]` actually blocks them. Bootstrap takes `--dev-email`.
+  `editors=[dev-email, service-account-email]` actually blocks the
+  collector. Bootstrap takes `--dev-email`. The service account email
+  is read from the credentials JSON and must be on the editors list,
+  otherwise future bootstrap re-runs cannot delete the existing
+  protected ranges (Sheets API rejects deleteProtectedRange from a
+  user not in `protectedRange.editors.users`).
 - **Validator checks STYLE-series → chart-tab completeness.** For each
   (chart_id, series_key) declared in STYLE-series, the chart tab must
   contain that series. Without this, a data collector blanking the entire
@@ -1014,6 +1022,35 @@ After step 5, hand off to the data collector with `docs/data-collector-guide-th.
   schema-cleanup would diff every file purely on EOF-newline mismatch
   (canonical-JSON comparison would still pass, but `git diff` would
   not — making the migration noisy).
+
+## Resolved decisions (round 7 — Codex external review)
+
+- **Bootstrap rerun cannot hit Sheets' "delete last sheet" constraint.**
+  Round 6 introduced a leftover-placeholder cleanup loop that ran
+  *before* adding the new placeholder. If a prior bootstrap failed
+  partway through and the only surviving tab was a stale
+  `_bootstrap_placeholder_*`, the rerun would try to delete that last
+  sheet and the Sheets API would refuse — bricking recovery. The
+  cleanup loop is gone; the new placeholder is added first, then a
+  single "delete every tab except the new placeholder" pass sweeps
+  any leftover placeholders along with the rest.
+- **Blank `kpi_series_key` in STYLE-charts now hard-fails validation.**
+  Round 6 added the cross-check but only when the cell was non-empty,
+  so a blank cell silently passed even though STYLE-charts is
+  documented as the authoritative KPI contract. Validator now emits
+  an explicit error on blank, and a regression test covers it.
+- **Layer-1 (Sheets data validation) year formula tightened.** Round
+  6.5's CUSTOM_FORMULA accepted fractional scalars (`2500.5` passed
+  `ISNUMBER`) and reversed ranges (`2568-2566` had both endpoints in
+  range, but no start≤end check). Layer 2 (Python) already rejected
+  both, but Layer 1 is meant to catch them at entry time. The scalar
+  branch now requires `A18=INT(A18)`; the range branch adds
+  `VALUE(LEFT(A18,4))<=VALUE(RIGHT(A18,4))`.
+- **Spec text resynchronised with plan.** The Apps Script polling URL
+  in the user flow still showed `per_page=20`, and the Initial Migration
+  table + protection bullet still showed `editors=[dev-email]` — both
+  had been superseded by round 6 fixes in the plan but not propagated
+  to the spec. Spec now matches plan.
 
 ## Effort Estimate
 
