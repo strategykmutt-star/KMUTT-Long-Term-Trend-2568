@@ -1,0 +1,180 @@
+name: Sync from Sheets
+
+run-name: "Sync from Sheets [${{ github.event.client_payload.correlation_id }}]"
+
+on:
+  repository_dispatch:
+    types: [sync-sheets]
+
+# pages + id-token are required by the deploy job;
+# contents:write is required by the sync job to commit JSON;
+# actions:read is required so jobs can read each other's outputs/artifacts.
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: read
+
+# Avoid two concurrent publishes racing each other into Pages.
+concurrency:
+  group: sync-from-sheets
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      did_commit: ${{ steps.commit.outputs.did_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Preflight — required config present
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
+        run: |
+          if [ -z "$SHEET_ID" ]; then
+            # Write a structured errors.json so the Apps Script modal can
+            # render a meaningful message instead of "ไม่ทราบสาเหตุ".
+            cat > errors.json <<'EOF'
+          [{"tab":null,"field":"config","message_th":"GitHub Variable KMUTT_TRENDS_SHEET_ID ยังไม่ได้ตั้งค่า — ติดต่อ dev","message_en":"GitHub repository Variable KMUTT_TRENDS_SHEET_ID is not set — contact the developer"}]
+          EOF
+            echo "::error::KMUTT_TRENDS_SHEET_ID is unset. Set it in repo Settings → Variables."
+            exit 1
+          fi
+
+      - name: Write service account credentials
+        env:
+          GCP_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          # Use printf via env-var (NOT echo via ${{ … }}) so single-quotes
+          # or backslashes inside the JSON cannot break the shell or be
+          # interpreted as escape sequences.
+          printf '%s' "$GCP_KEY" > /tmp/gcp-key.json
+
+      # SHEET_ID and USER_EMAIL go through `env:` rather than direct
+      # `${{ ... }}` interpolation in shell. This prevents script
+      # injection from a malicious `repository_dispatch` payload: with
+      # env vars, a payload value like `abc"; rm -rf` becomes a literal
+      # string assigned to the env var, not shell tokens. See:
+      # https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+      #
+      # Defense-in-depth: SHEET_ID is read from a GitHub repository
+      # Variable, NOT the dispatch payload, so an attacker with PAT
+      # cannot point the workflow at a different sheet they control.
+
+      - name: Run sync script (publish)
+        if: github.event.client_payload.dry_run != true
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
+        run: |
+          python scripts/sync_from_sheets.py \
+            --sheet-id "$SHEET_ID" \
+            --credentials /tmp/gcp-key.json \
+            --result-out result.json \
+            --errors-out errors.json
+
+      - name: Run sync script (dry-run)
+        if: github.event.client_payload.dry_run == true
+        env:
+          SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
+        run: |
+          python scripts/sync_from_sheets.py \
+            --sheet-id "$SHEET_ID" \
+            --credentials /tmp/gcp-key.json \
+            --result-out result.json \
+            --errors-out errors.json \
+            --dry-run
+
+      - name: Upload sync-result artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-result
+          path: result.json
+          retention-days: 7
+
+      - name: Upload sync-errors artifact
+        if: failure() && hashFiles('errors.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-errors
+          path: errors.json
+          retention-days: 7
+
+      - name: Commit and push if changes
+        id: commit
+        if: success() && github.event.client_payload.dry_run != true
+        env:
+          # USER_EMAIL also goes through env to avoid shell injection in
+          # the commit message. Double-quoting `"$USER_EMAIL"` makes
+          # bash treat the value as a literal string.
+          USER_EMAIL: ${{ github.event.client_payload.user_email }}
+        run: |
+          if [ -z "$(git status --porcelain web/src/data/)" ]; then
+            echo "No JSON changes — skipping commit (idempotent no-op)."
+            echo "did_commit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "kmutt-trends-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add web/src/data/
+          git commit -m "Sync from Sheets by $USER_EMAIL at $(date -u +%FT%TZ)"
+          git push
+          echo "did_commit=true" >> "$GITHUB_OUTPUT"
+
+  # The deploy job replicates the existing deploy.yml steps and ALWAYS runs
+  # after a successful non-dry-run sync — even when no JSON changed. This
+  # makes "click Publish again" a valid recovery action when Pages got out
+  # of sync with main (e.g. a previous deploy failed). It also ensures the
+  # Apps Script modal only reports "success" after the dashboard has
+  # actually been redeployed.
+  deploy:
+    needs: sync
+    if: success() && github.event.client_payload.dry_run != true
+    runs-on: ubuntu-latest
+    # MUST share the 'pages' concurrency group with the existing deploy.yml
+    # so a sync-triggered deploy can't race a manual deploy or push-triggered
+    # deploy and overwrite the dashboard with a stale artifact. Workflow-
+    # level group 'sync-from-sheets' already serializes sync runs; this
+    # job-level group also serializes ALL Pages deployments across both
+    # workflows.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: ./web
+    steps:
+      # Always check out main HEAD; if sync committed, this includes the
+      # new JSON. If sync was a no-op, this is just main.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_BASE: /${{ github.event.repository.name }}/
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+      - id: deployment
+        uses: actions/deploy-pages@v4
