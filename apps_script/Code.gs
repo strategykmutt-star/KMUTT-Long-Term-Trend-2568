@@ -55,23 +55,34 @@ function pollStatus(correlationId) {
   const props = _props();
   const repo = props.getProperty('REPO');
   const pat = props.getProperty('GITHUB_PAT');
+  // DEBUG: surface key values to Cloud logs so the modal-poll-finds-nothing
+  // mystery can be diagnosed without round-tripping screenshots.
+  Logger.log('[poll] correlationId=' + JSON.stringify(correlationId) + ' repo=' + JSON.stringify(repo));
+  const url = `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=100`;
+  Logger.log(`[poll] url=${url}`);
   // per_page=100 is GitHub's hard cap. We need this many because
   // `event=repository_dispatch` filter cannot also filter by event_type;
   // other dispatch types or bursty publishes could push our run off the
   // first page with the default per_page=30.
   const r = UrlFetchApp.fetch(
-    `https://api.github.com/repos/${repo}/actions/runs?event=repository_dispatch&per_page=100`,
+    url,
     { headers: _ghHeaders(pat), muteHttpExceptions: true }
   );
-  if (r.getResponseCode() !== 200) {
-    return { found: false, error: `GitHub API ตอบ HTTP ${r.getResponseCode()}` };
+  const code = r.getResponseCode();
+  Logger.log(`[poll] response code=${code}`);
+  if (code !== 200) {
+    const body = r.getContentText();
+    Logger.log(`[poll] non-200 body (first 300 chars): ${body.slice(0, 300)}`);
+    return { found: false, error: `GitHub API ตอบ HTTP ${code}` };
   }
   const runs = JSON.parse(r.getContentText()).workflow_runs || [];
+  Logger.log(`[poll] got ${runs.length} runs; titles (first 5): ${runs.slice(0, 5).map(r => r.display_title).join(' | ')}`);
   // IMPORTANT: filter on display_title (which reflects `run-name:`), NOT name
   // (which is the workflow's static `name:` field).
   const match = runs.find(run =>
     run.display_title && run.display_title.indexOf(correlationId) >= 0
   );
+  Logger.log(`[poll] match=${match ? match.id : 'none'}`);
   if (!match) return { found: false };
   return {
     found: true,
