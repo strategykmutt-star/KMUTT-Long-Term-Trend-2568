@@ -34,6 +34,16 @@ SECTION_COLOR = {
 }
 
 
+def _rgb_to_hex(rgb: dict) -> str:
+    """Convert {'red': 0-1, 'green': 0-1, 'blue': 0-1} float dict to '#rrggbb'
+    hex string. gspread 6.x changed update_tab_color() to accept hex strings
+    only; the RGB-dict form raises AttributeError inside convert_hex_to_colors_dict.
+    """
+    return "#{:02x}{:02x}{:02x}".format(
+        int(rgb["red"] * 255), int(rgb["green"] * 255), int(rgb["blue"] * 255)
+    )
+
+
 def load_charts(data_dir: Path) -> list[dict]:
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(data_dir.glob("*.json"))]
 
@@ -189,7 +199,7 @@ def main():
         ws = sh.add_worksheet(title=tab_name(c), rows=max(60, len(values) + 10),
                               cols=1 + len(c["series"]) + 1)
         ws.update("A1", values, value_input_option="RAW")
-        ws.update_tab_color(SECTION_COLOR[c["section"]])
+        ws.update_tab_color(_rgb_to_hex(SECTION_COLOR[c["section"]]))
         ws.freeze(rows=17)
         chart_gid[c["id"]] = ws.id  # gspread Worksheet.id == Sheets gid
 
