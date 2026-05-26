@@ -26,13 +26,14 @@
     <a href="https://github.com/<?= repo ?>/actions" target="_blank">ดูสถานะ build บน GitHub →</a>
   </div>
 <script>
-  // Use <?!= ... ?> (force-print) so the JSON-stringified output is
-  // injected verbatim. <?= ... ?> in a <script> context also wraps the
-  // value in JS string quotes and escapes its inner quotes, which
-  // double-encodes a JSON.stringify result: e35c4c293f5a4c19 becomes
-  // the JS string "\"e35c4c293f5a4c19\"" instead of "e35c4c293f5a4c19".
-  // The extra quote chars then prevent indexOf() in pollStatus() from
-  // matching the GitHub run's display_title.
+  // Use force-print scriptlets for the values below. HtmlService's
+  // contextual escape (the safe-print scriptlet) re-quotes and
+  // backslash-escapes the JSON.stringify output, producing a string
+  // with literal quote chars inside (e.g. "\"abc\"" instead of "abc"),
+  // which then prevents indexOf() in pollStatus() from matching the
+  // GitHub run display_title. The force-print scriptlet emits the
+  // already-quoted JSON literal as-is. See:
+  // https://developers.google.com/apps-script/guides/html/templates
   const CORRELATION_ID = <?!= JSON.stringify(correlationId) ?>;
   const DRY_RUN = <?!= dryRun ? 'true' : 'false' ?>;
   const POLL_INTERVAL_MS = 5000;
