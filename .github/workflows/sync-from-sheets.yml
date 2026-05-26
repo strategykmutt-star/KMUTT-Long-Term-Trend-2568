@@ -75,7 +75,7 @@ jobs:
         env:
           SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
         run: |
-          python scripts/sync_from_sheets.py \
+          python -m scripts.sync_from_sheets \
             --sheet-id "$SHEET_ID" \
             --credentials /tmp/gcp-key.json \
             --result-out result.json \
@@ -86,7 +86,7 @@ jobs:
         env:
           SHEET_ID: ${{ vars.KMUTT_TRENDS_SHEET_ID }}
         run: |
-          python scripts/sync_from_sheets.py \
+          python -m scripts.sync_from_sheets \
             --sheet-id "$SHEET_ID" \
             --credentials /tmp/gcp-key.json \
             --result-out result.json \
