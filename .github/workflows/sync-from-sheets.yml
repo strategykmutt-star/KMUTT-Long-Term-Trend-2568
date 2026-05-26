@@ -54,9 +54,9 @@ jobs:
         env:
           GCP_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          # Use printf via env-var (NOT echo via ${{ … }}) so single-quotes
-          # or backslashes inside the JSON cannot break the shell or be
-          # interpreted as escape sequences.
+          # Use printf via env-var (NOT echo with direct expression
+          # interpolation) so single-quotes or backslashes inside the JSON
+          # cannot break the shell or be interpreted as escape sequences.
           printf '%s' "$GCP_KEY" > /tmp/gcp-key.json
 
       # SHEET_ID and USER_EMAIL go through `env:` rather than direct
