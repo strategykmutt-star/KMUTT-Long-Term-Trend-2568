@@ -44,6 +44,41 @@ def _rgb_to_hex(rgb: dict) -> str:
     )
 
 
+def _install_429_retry():
+    """Monkey-patch gspread's HTTP layer to retry on Sheets API 429 (quota
+    exceeded) with exponential backoff.
+
+    Sheets API enforces ~60 write requests/user/minute. Bootstrap bursts
+    many small writes (create tab → update → tab color → freeze, × 20 charts,
+    plus the cleanup delete loop), so a clean run easily trips the limit
+    after the first 15–20 writes. Without retry, the script aborts and
+    leaves the workbook half-built; with retry, it pauses long enough for
+    the per-minute window to roll over and continues.
+
+    Backoff schedule: 30s, 60s, 90s, 120s, 150s (5 attempts total). Any
+    non-429 APIError propagates unchanged on the first try.
+    """
+    import time as _time
+    from gspread.http_client import HTTPClient
+    from gspread.exceptions import APIError
+    _orig = HTTPClient.request
+
+    def request(self, *args, **kwargs):
+        for attempt in range(5):
+            try:
+                return _orig(self, *args, **kwargs)
+            except APIError as e:
+                if e.response.status_code == 429 and attempt < 4:
+                    wait = 30 * (attempt + 1)
+                    print(f"  [429] Sheets quota hit; sleeping {wait}s "
+                          f"(attempt {attempt + 1}/5)...", flush=True)
+                    _time.sleep(wait)
+                    continue
+                raise
+
+    HTTPClient.request = request
+
+
 def load_charts(data_dir: Path) -> list[dict]:
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(data_dir.glob("*.json"))]
 
@@ -127,6 +162,8 @@ def main():
                          "Data collector edits are blocked by editors-allowlist.")
     ap.add_argument("--data-dir", default="web/src/data")
     args = ap.parse_args()
+
+    _install_429_retry()
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(args.credentials, scopes=scopes)
